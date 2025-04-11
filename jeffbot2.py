@@ -90,6 +90,7 @@ async def on_ready():
     await bot.add_cog(GeneralCog(bot))
     await bot.add_cog(AdminRollCog(bot))  
     await bot.add_cog(ShopCog(bot))
+    await bot.add_cog(RPSCog(bot))
     try:
         synced = await bot.tree.sync()  # Sync slash commands globally
         print(f"Slash commands synced: {len(synced)} commands.")
@@ -343,7 +344,7 @@ class GivePoopModal(discord.ui.Modal, title="Give Poop Role"):
         try:
             await target_member.add_roles(poop_role, reason=f"Shop purchase: given by {self.shop_user}")
             await interaction.response.send_message(f"Poop role given to {target_member.mention}!", ephemeral=True)
-            # (You may add persistent scheduling to remove the role after 24 hours as needed)
+            await interaction.channel.send(f"{self.shop_user.mention} just pooped on {target_member.mention}!")
         except Exception as e:
             await interaction.response.send_message(f"Error: {e}", ephemeral=True)
 
@@ -426,6 +427,7 @@ class TimeoutModal(discord.ui.Modal, title="Timeout User"):
             # Using the standard timeout method – adjust if necessary depending on your library's version.
             await target_member.timeout(duration, reason=f"Shop purchase: timed out by {self.shop_user}")
             await interaction.response.send_message(f"{target_member.mention} has been timed out for 1 hour.", ephemeral=True)
+            await interaction.channel.send(f"{self.shop_user.mention} just timed out {target_member.mention}!")
         except discord.Forbidden as e:
             # Refund the purchase if the target is a mod/admin (or otherwise cannot be timed out)
             await add_income(str(self.shop_user.id), SHOP_COST)
@@ -462,6 +464,7 @@ class ShopView(discord.ui.View):
         try:
             await self.shop_user.remove_roles(poop_role, reason="Shop purchase: remove poop role")
             await interaction.response.send_message("Poop role removed from you. Enjoy your fresh start!", ephemeral=True)
+            await interaction.channel.send(f"{self.shop_user.mention} just removed their poop role!")
         except Exception as e:
             await interaction.response.send_message(f"Error removing poop role: {e}", ephemeral=True)
 
@@ -703,18 +706,14 @@ class GeneralCog(commands.Cog):
                 ephemeral=True
             )
             return
-        roll = random.choices(range(1, 1001), weights=[1000 - i for i in range(1000)])[0]
-        if roll >= 998:
-            win_amount = 8000
+        roll = random.choices(range(1, 1001))[0]
+        if roll >= 999:
+            win_amount = 10000
         elif roll >= 990:
-            win_amount = 2000
-        elif roll >= 980:
             win_amount = 1000
-        elif roll >= 950:
-            win_amount = 800
-        elif roll >= 900:
+        elif roll >= 960:
             win_amount = 600
-        elif roll >= 800:
+        elif roll >= 900:
             win_amount = 300
         elif roll >= 600:
             win_amount = 200
@@ -1470,6 +1469,274 @@ def calculate_hand_value(hand, is_dealer=False):
 # Cogs
 ############################################################################################################
 
+# -------------------------------
+# RPS Accept View: Handles challenge acceptance with a dynamic 30s countdown and a Decline option.
+# -------------------------------
+
+class RPSAcceptView(discord.ui.View):
+    def __init__(self, challenger: discord.Member, challenged: discord.Member, wager: int):
+        super().__init__(timeout=45)  # Timeout of 45 seconds for acceptance
+        self.challenger = challenger
+        self.challenged = challenged
+        self.wager = wager
+        self.deadline = time.time() + 45
+        self.challenge_over = False
+        self.message = None  # This will be set once we send the challenge message
+
+    async def start_countdown(self, message: discord.Message):
+        """Dynamically update the embed's countdown timer every second."""
+        self.message = message
+        while not self.challenge_over:
+            remaining = int(self.deadline - time.time())
+            if remaining <= 0:
+                break
+            # Make a copy of the current embed and update its description.
+            embed = message.embeds[0].copy()
+            embed.description = (
+                f"{self.challenger.mention} challenges {self.challenged.mention} to a Rock Paper Scissors match for **{self.wager}** coins!\n"
+                f"{self.challenged.mention}, click **Accept** to play or **Decline** if you don't wish to play.\n"
+                f"Time remaining: **{remaining} seconds**"
+            )
+            try:
+                await message.edit(embed=embed, view=self)
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+        # When the loop finishes, if challenge hasn't been accepted/declined:
+        if not self.challenge_over:
+            self.challenge_over = True
+            # Refund the challenger.
+            await add_income(str(self.challenger.id), self.wager)
+            final_embed = message.embeds[0].copy()
+            final_embed.description = "Challenge timed out – no response. Match declined."
+            try:
+                await message.edit(embed=final_embed, view=None)
+            except Exception:
+                pass
+
+    async def on_timeout(self):
+        # As a backup, if the view times out.
+        if not self.challenge_over and self.message:
+            self.challenge_over = True
+            await add_income(str(self.challenger.id), self.wager)
+            embed = self.message.embeds[0].copy()
+            embed.description = "Challenge timed out – no response. Match declined."
+            try:
+                await self.message.edit(embed=embed, view=None)
+            except Exception:
+                pass
+            await self.message.channel.send("Challenge timed out – no response. Match declined.")
+
+    @discord.ui.button(label="Accept Challenge", style=discord.ButtonStyle.success, custom_id="rps_accept")
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Only allow the challenged to press this button.
+        if interaction.user.id != self.challenged.id:
+            await interaction.response.send_message("Only the challenged user can respond. (Waiting for response…)", ephemeral=True)
+            return
+
+        # Check if the challenged has enough funds.
+        if user_balances.get(str(self.challenged.id), 0) < self.wager:
+            await interaction.response.send_message("You don't have enough coins to accept this challenge.", ephemeral=True)
+            return
+
+        # Deduct funds from challenged.
+        success = await deduct_points(str(self.challenged.id), self.wager)
+        if not success:
+            await interaction.response.send_message("Failed to deduct coins. Challenge cancelled.", ephemeral=True)
+            return
+
+        self.challenge_over = True  # Stop the countdown
+
+        # Update the message to announce game start.
+        embed = discord.Embed(
+            title="Rock Paper Scissors Game",
+            description=(f"{self.challenger.mention} vs {self.challenged.mention}\n"
+                         f"Each player wagered **{self.wager}** coins.\n"
+                         "Make your choice below:"),
+            color=discord.Color.blurple()
+        )
+        await interaction.message.edit(embed=embed, view=RPSGameView(self.challenger, self.challenged, self.wager))
+        await interaction.response.send_message("Challenge accepted! Let's play!", ephemeral=True)
+
+    @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger, custom_id="rps_decline")
+    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Only allow the challenged to decline.
+        if interaction.user.id != self.challenged.id:
+            await interaction.response.send_message("Only the challenged user can respond. (Waiting for response…)", ephemeral=True)
+            return
+
+        self.challenge_over = True  # Stop the countdown
+
+        # Refund the challenger's wager.
+        await add_income(str(self.challenger.id), self.wager)
+        embed = interaction.message.embeds[0].copy()
+        embed.description = "Challenge declined."
+        await interaction.message.edit(embed=embed, view=None)
+        await interaction.response.send_message("You declined the challenge.", ephemeral=True)
+        await interaction.channel.send(f"{self.challenged.mention} declined {self.challenger.mention}'s Rock Paper Scissors challenge!")
+
+# -------------------------------
+# RPS Game View: Handles the actual game (Rock, Paper, Scissors choices)
+# -------------------------------
+
+class RPSGameView(discord.ui.View):
+    def __init__(self, challenger: discord.Member, challenged: discord.Member, wager: int):
+        super().__init__(timeout=60)
+        self.challenger = challenger
+        self.challenged = challenged
+        self.wager = wager
+        self.choices = {}  # Mapping of user id to their full choice ("Rock", "Paper", "Scissors")
+        self.game_ended = False  # Flag to ensure game end happens only once
+
+    async def end_game(self, interaction: discord.Interaction):
+        if self.game_ended:
+            return
+        self.game_ended = True
+        
+        choice1 = self.choices.get(self.challenger.id)
+        choice2 = self.choices.get(self.challenged.id)
+        if choice1 is None or choice2 is None:
+            return
+
+        total_pot = self.wager * 2
+        result_text = ""
+        if choice1 == choice2:
+            # Tie: refund wagers.
+            await add_income(str(self.challenger.id), self.wager)
+            await add_income(str(self.challenged.id), self.wager)
+            result_text = "It's a tie! Both players get their coins back."
+        else:
+            win_map = {
+                "Rock": "Scissors",
+                "Paper": "Rock",
+                "Scissors": "Paper"
+            }
+            winner = self.challenger if win_map[choice1] == choice2 else self.challenged
+            result_text = f"{winner.mention} wins and takes **{total_pot}** coins!"
+            await add_income(str(winner.id), total_pot)
+
+        for child in self.children:
+            child.disabled = True
+
+        result_embed = discord.Embed(
+            title="Rock Paper Scissors Result",
+            description=(f"{self.challenger.mention} chose **{choice1}** and "
+                         f"{self.challenged.mention} chose **{choice2}**.\n\n{result_text}"),
+            color=discord.Color.gold()
+        )
+        # Update the existing message.
+        await interaction.message.edit(embed=result_embed, view=self)
+        # Send a public announcement.
+        await interaction.channel.send(result_embed.description)
+
+        # Wait a few seconds to let players read the result, then delete the interactive message.
+        #await asyncio.sleep(1)
+        try:
+            await interaction.message.delete()
+        except Exception as e:
+            print(f"Error deleting game message: {e}")
+
+    async def record_choice(self, interaction: discord.Interaction, choice: str):
+        if interaction.user.id not in (self.challenger.id, self.challenged.id):
+            await interaction.response.send_message("You're not a participant in this game.", ephemeral=True)
+            return
+        if interaction.user.id in self.choices:
+            await interaction.response.send_message("You have already made your choice.", ephemeral=True)
+            return
+        self.choices[interaction.user.id] = choice
+        if len(self.choices) == 2:
+            await self.end_game(interaction)
+
+    @discord.ui.button(label="Rock", style=discord.ButtonStyle.primary, custom_id="rps_rock")
+    async def rock_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.record_choice(interaction, "Rock")
+
+    @discord.ui.button(label="Paper", style=discord.ButtonStyle.primary, custom_id="rps_paper")
+    async def paper_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.record_choice(interaction, "Paper")
+
+    @discord.ui.button(label="Scissors", style=discord.ButtonStyle.primary, custom_id="rps_scissors")
+    async def scissors_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.record_choice(interaction, "Scissors")
+
+# -------------------------------
+# RPS Cog: The command to start an RPS challenge.
+# -------------------------------
+
+class RPSCog(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+    @app_commands.command(name="rps", description="Challenge someone to Rock Paper Scissors for coins!")
+    @app_commands.describe(target="The member to challenge", amount="The wager amount in coins")
+    async def rps(self, interaction: discord.Interaction, target: discord.Member, amount: int):
+        challenger = interaction.user
+        wager = amount
+        if target.id == challenger.id:
+            await interaction.response.send_message("You cannot challenge yourself!", ephemeral=True)
+            return
+        if user_balances.get(str(challenger.id), 0) < wager:
+            await interaction.response.send_message("You don't have enough coins to wager that amount.", ephemeral=True)
+            return
+
+        # Deduct the wager from the challenger.
+        success = await deduct_points(str(challenger.id), wager)
+        if not success:
+            await interaction.response.send_message("Failed to deduct wager from your balance.", ephemeral=True)
+            return
+
+        # Create the challenge embed with initial countdown.
+        embed = discord.Embed(
+            title="Rock Paper Scissors Challenge",
+            description=(
+                f"{challenger.mention} challenges {target.mention} to a Rock Paper Scissors match for **{wager}** coins!\n"
+                f"{target.mention}, click **Accept** to play or **Decline** if you don't wish to play.\n"
+                f"Time remaining: **30 seconds**"
+            ),
+            color=discord.Color.orange()
+        )
+        view = RPSAcceptView(challenger, target, wager)
+        msg = await interaction.response.send_message(embed=embed, view=view)
+        # For slash commands the original response can be retrieved with:
+        challenge_msg = await interaction.original_response()
+        view.message = challenge_msg
+        # Start the countdown task.
+        asyncio.create_task(view.start_countdown(challenge_msg))
+        # Also announce publicly.
+        await interaction.channel.send(f"{challenger.mention} has challenged {target.mention} to Rock Paper Scissors for **{wager}** coins!")
+
+    @commands.command(name="rps")
+    async def rps_command(self, ctx: commands.Context, target: discord.Member, amount: int):
+        challenger = ctx.author
+        wager = amount
+        if target.id == challenger.id:
+            await ctx.send("You cannot challenge yourself!")
+            return
+        if user_balances.get(str(challenger.id), 0) < wager:
+            await ctx.send("You don't have enough coins to wager that amount.")
+            return
+
+        success = await deduct_points(str(challenger.id), wager)
+        if not success:
+            await ctx.send("Failed to deduct wager from your balance.")
+            return
+
+        embed = discord.Embed(
+            title="Rock Paper Scissors Challenge",
+            description=(
+                f"{challenger.mention} challenges {target.mention} to a Rock Paper Scissors match for **{wager}** coins!\n"
+                f"{target.mention}, click **Accept** to play or **Decline** if you don't wish to play.\n"
+                f"Time remaining: **30 seconds**"
+            ),
+            color=discord.Color.orange()
+        )
+        view = RPSAcceptView(challenger, target, wager)
+        msg = await ctx.send(embed=embed, view=view)
+        view.message = msg
+        asyncio.create_task(view.start_countdown(msg))
+        await ctx.send(f"{challenger.mention} has challenged {target.mention} to Rock Paper Scissors for **{wager}** coins!")
+
+
 class AdminRollCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -1654,6 +1921,7 @@ async def setup(bot):
     await bot.add_cog(SummaryCog(bot))
     await bot.add_cog(GeneralCog(bot))
     await bot.add_cog(ShopCog(bot))
+    await bot.add_cog(RPSCog(bot))
 
 # Run the bot
 bot.run(DISCORD_TOKEN)
