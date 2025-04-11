@@ -9,6 +9,7 @@ import sys
 import math
 import random
 import copy
+from dotenv import load_dotenv
 from discord.ext import commands
 from discord import ButtonStyle, app_commands
 from datetime import datetime, timedelta, timezone
@@ -16,11 +17,9 @@ from datetime import time as dtime  # for midnight
 import tiktoken
 import re
 
-# Replace with your OpenAI API key
-openai.api_key = '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'
-
-# Replace with your Discord bot token
-DISCORD_TOKEN = 'MTI4NjA3OTQ4NDgzMDk0NTM0MQ.Gil8b6.UXtRx9wKR7Y5IF_6jGX5cQd5A9yWIENLNtfkAQ'
+load_dotenv()
+openai.api_key = os.getenv('OPENAI_API_KEY')
+DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 
 # The ID of the user whose messages you want to collect
 TARGET_USER_ID = 184481785172721665  # e.g., 123456789012345678
