@@ -106,66 +106,70 @@ async def on_ready():
 
 @bot.event
 async def on_message(message):
+    # 1. Ignore the bot’s own messages
     if message.author == bot.user:
         return
 
-    # --- Additional Functionality 1: Only consider messages in RANDOM_RESPONSE_CHANNEL_ID ---
+    # 2. Random‐response feature (your existing functionality)
     if message.channel.id in RANDOM_RESPONSE_CHANNEL_ID:
         if random.randint(1, RANDOM_RESPONSE_CHANCE) == 2:
-            # Since the message is already in the target channel, respond in the same channel
             response = await generate_response(message.content)
             await message.reply(response)
 
-    # --- Additional Functionality 2: For a specific user, respond with "Lenny 😋" in any channel ---
+    # 3. Special user “Lenny” response
     if message.author.id == SPECIAL_USER_ID:
         if random.randint(1, SPECIAL_USER_RESPONSE_CHANCE) == 2:
             await message.reply(SPECIAL_USER_RESPONSE)
 
-    # Check if the message starts with the command prefix
+    # 4. If it’s a prefix command, let the commands extension handle it
     if message.content.startswith(bot.command_prefix):
-        # Process commands as usual
         await bot.process_commands(message)
         return
 
-    # Check if the message is a reply to the bot or mentions the bot
-    is_bot_interaction = bot.user in message.mentions or (message.reference and message.reference.resolved.author == bot.user)
+    # 5. Build threaded context by walking up the reply chain
+    context_messages = []
+    ref_msg = message
+    while ref_msg.reference and isinstance(ref_msg.reference.resolved, discord.Message):
+        parent = ref_msg.reference.resolved
+        context_messages.append(parent)
+        ref_msg = parent
 
+    # 6. Format context in chronological order
+    if context_messages:
+        context_messages.reverse()
+        context_text = ""
+        for msg in context_messages:
+            author = msg.author.display_name
+            # Collapse newlines for a clean prompt
+            content = msg.content.replace("\n", " ")
+            context_text += f"{author}: {content}\n"
+    else:
+        context_text = ""
+
+    # 7. Determine whether to respond (mention or reply to the bot)
+    is_bot_interaction = (
+        bot.user in message.mentions or
+        (message.reference
+         and isinstance(message.reference.resolved, discord.Message)
+         and message.reference.resolved.author.id == bot.user.id)
+    )
+
+    # 8. If it’s directed at the bot, generate with full context
     if is_bot_interaction:
-        # Remove the bot mention from the message content
-        content = message.content.replace(f'<@!{bot.user.id}>', '').replace(f'<@{bot.user.id}>', '').strip()
-        
-        # Check if the content starts with a known command
-        if content.lower().startswith('commands'):
-            # Invoke the commands command
-            ctx = await bot.get_context(message)
-            await ctx.invoke(bot.get_command('commands'))
-        elif content.lower().startswith(('ask', 'daily', 'balance', 'leaderboard', 'bj', 'slots', 'summary')):
-            # Split the content into command and arguments
-            parts = content.split(maxsplit=1)
-            command = parts[0].lower()
-            arg = parts[1] if len(parts) > 1 else ''
-            
-            # Get the command object
-            cmd = bot.get_command(command)
-            if cmd:
-                ctx = await bot.get_context(message)
-                try:
-                    if arg:
-                        await ctx.invoke(cmd, arg)
-                    else:
-                        await ctx.invoke(cmd)
-                except commands.errors.MissingRequiredArgument:
-                    await message.reply(f"The {command} command requires additional arguments. Use !!commands to see usage.")
-            else:
-                # If no command is recognized, generate a response
-                response = await generate_response(content)
-                await message.reply(response)
-        else:
-            # If no command is recognized, generate a response
-            response = await generate_response(content)
-            await message.reply(response)
+        # Strip out the bot mention
+        user_content = (message.content
+                        .replace(f'<@!{bot.user.id}>', '')
+                        .replace(f'<@{bot.user.id}>', '')
+                        .strip())
 
-    # Add income for each message (if you want to keep this feature)
+        # Prepend any gathered context
+        prompt = context_text + user_content
+
+        # Generate and reply
+        response = await generate_response(prompt)
+        await message.reply(response)
+
+    # 9. Add income for normal user messages
     if not message.author.bot:
         await add_income(str(message.author.id), 5)
 
@@ -1741,8 +1745,8 @@ class AdminRollCog(commands.Cog):
         self.bot = bot
         # IDs from the requirements
         self.guild_id = 1287144786452680744
-        self.channel_id = 1310101027550400565
-        self.role_id = 1287151157797589074
+        self.channel_id = 1363018084214112426
+        self.role_id = 1346706983780225045
         self.admin_candidates_file = "admin_roll.txt"
         # Schedule the background loop
         self.bot.loop.create_task(self.admin_roll_loop())
@@ -1800,15 +1804,21 @@ class AdminRollCog(commands.Cog):
         # Weighted selection: calculate weights so that candidates with a longer gap since last admin have a higher chance.
         selected = []
         available = candidates.copy()
+        RECOVERY_WEEKS = 8                              # fully back to 4% after 4 weeks
+        MIN_PROB = 0.01                                 # 1% floor
+        N = len(available)                              # e.g. 25 candidates
+        floor_wt = MIN_PROB * (N - 1) / (1 - MIN_PROB)   # ≈0.2424
+
         for _ in range(3):
-            if not available:
-                break
             weights = []
             for uid in available:
-                # Compute weight as the time since last being admin (or current_time if never)
                 last_time = last_admin_times.get(uid, 0)
-                weight = current_time - last_time
-                weights.append(weight)
+                weeks = (current_time - last_time) / (7*24*3600)
+                # recovery factor: 0.0 at just-rolled, 1.0 after RECOVERY_WEEKS
+                factor = min(weeks / RECOVERY_WEEKS, 1.0)
+                # linear blend from floor_wt up to 1.0
+                w = floor_wt + (1.0 - floor_wt) * factor
+                weights.append(w)
             choice = random.choices(available, weights=weights, k=1)[0]
             selected.append(choice)
             available.remove(choice)
