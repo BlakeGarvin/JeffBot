@@ -9,14 +9,17 @@ import sys
 import math
 import random
 import copy
+import secrets, string
 from dotenv import load_dotenv
 from discord.ext import commands
 from discord import ButtonStyle, app_commands, Interaction
 from datetime import datetime, timedelta, timezone
 from datetime import time as dtime  # for midnight
 from openai import AsyncOpenAI
+from urllib.parse import quote_plus  # NEW: for URL‐encoding summoner names
 import tiktoken
 import re
+import random
 
 load_dotenv()
 client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -30,6 +33,10 @@ MAX_USER_MESSAGES = 8000
 
 SHOP_COST = 10000  # Adjust this to 10000 if you want a higher cost
 
+TEST_MODE = os.getenv('TEST_MODE')
+
+OP_GG_REGION = "na" 
+DRAFTLOL_BASE_URL = "https://draftlol.dawe.gg"
 
 # List of channel IDs to collect messages from
 TARGET_CHANNEL_IDS = [753959443263389737, 781309198855438336]
@@ -72,6 +79,31 @@ user_balances = {}
 
 active_games = set()
 
+# Dictionary to map Discord user IDs to op.gg URLs for League of Legends
+id_to_opgg = {
+
+    187737483088232449: "Trombone#NA1"
+
+}
+
+# Dictionary to store active custom game lobbies
+custom_lobbies = {}  # key: message.id of lobby message, value: LobbyData object
+
+# Data class to track lobby state
+class LobbyData:
+    def __init__(self, creator_id, max_players: int = 10):
+        self.creator_id = creator_id
+        self.max_players = max_players 
+        self.players = []  # list of discord.Member
+        self.message = None  # discord.Message for the lobby embed
+        self.guild = None
+        self.captains_selected = False
+        self.captains = []  # list of discord.Member
+        self.current_picker_index = 0  # index in captains list
+        self.teams = {0: [], 1: []}  # teams 0=blue, 1=red
+        self.side_selected = None  # 0 for blue, 1 for red
+        self.draft_phase = 'awaiting_players'
+
 # Additional functionality configuration
 RANDOM_RESPONSE_CHANCE = 200  # 1 means 1% chance (adjust this variable as needed)
 RANDOM_RESPONSE_CHANNEL_ID = [1310101027550400565, 1330337673684193303]  # Channel where random responses will be sent
@@ -107,9 +139,11 @@ async def on_ready():
     print(f'Logged in as {bot.user}')
     await bot.add_cog(SummaryCog(bot))
     await bot.add_cog(GeneralCog(bot))
-    await bot.add_cog(AdminRollCog(bot))  
+    if not TEST_MODE:
+        await bot.add_cog(AdminRollCog(bot))  
     await bot.add_cog(ShopCog(bot))
     await bot.add_cog(RPSCog(bot))
+    await bot.add_cog(CustomsCog(bot))  # Register the new customs games cog
     try:
         synced = await bot.tree.sync()  # Sync slash commands globally
         print(f"Slash commands synced: {len(synced)} commands.")
@@ -350,12 +384,16 @@ async def summary(ctx, *, time_frame: str = "2hrs"):
             "   - Based on the conversation, provide logical conclusions or outcomes.\n"
             "   - For arguments or debates, summarize each side's stance, identify who was correct if applicable, and suggest improvements or next steps.\n\n"
             "Ensure the summary is clear, structured, and focused solely on what was said, avoiding interpretations except in the Conclusions section. "
-            "Use bullet points to organize the information for clarity.\n\n"
+            "Use bullet points to organize the information for clarity. Do not let the summary be longer than 2 discord messages.\n\n"
             f"Chat Logs:\n{formatted_messages}"
         )
 
         try:
-            response = await generate_response(summary_prompt, system_prompt=system_prompt)
+            response = await generate_response(
+                summary_prompt,
+                system_prompt=system_prompt,
+                allow_mentions=False
+            )
             chunks = split_text(response)
             for chunk in chunks:
                 await ctx.send(chunk)
@@ -890,13 +928,17 @@ class SummaryCog(commands.Cog):
                 "   - Based on the conversation, provide logical conclusions or outcomes.\n"
                 "   - For arguments or debates, summarize each side's stance, identify who was correct if applicable, and suggest improvements or next steps.\n\n"
                 "Ensure the summary is clear, structured, and focused solely on what was said, avoiding interpretations except in the Conclusions section. "
-                "Use bullet points to organize the information for clarity.\n\n"
+                "Use bullet points to organize the information for clarity. Do not make the summary be longer than 2 discord messages.\n\n"
                 f"Chat Logs:\n{formatted_messages}"
             )
 
             try:
-                response = await generate_response(summary_prompt, system_prompt=system_prompt)
-                chunks = split_text(response)
+                raw = await generate_response(
+                    summary_prompt,
+                    system_prompt=system_prompt,
+                    allow_mentions=False
+                )
+                chunks = split_text(raw)
                 for chunk in chunks:
                     await interaction.followup.send(chunk, ephemeral=True)
             except openai.error.RateLimitError as e:
@@ -1285,8 +1327,10 @@ async def save_messages():
         await f.write(json.dumps(data))
 
 
-async def generate_response(prompt, system_prompt=None, asker_mention=None):
+async def generate_response(prompt, system_prompt=None, asker_mention=None, allow_mentions=True):
     # Determine the system prompt based on context usage
+    if TEST_MODE:
+        return "Jeff bot is currently down for testing and developing new features. Mon."
     if system_prompt is None and JEFF:
         # If we know who asked, prepend that to the instructions
         if asker_mention:
@@ -1297,24 +1341,34 @@ async def generate_response(prompt, system_prompt=None, asker_mention=None):
         else:
             preamble = ""
         # Use the first 1000 messages for context
-        first_1000_messages = '\n'.join(user_messages)
+        first_1000_messages = '\n'.join(user_messages[2000:])
         #safe_print(first_1000_messages)
         # Build a human-readable list of known users → mention IDs
         mapping_lines = "\n".join(
             f"- {name} → <@{discord_id}>"
             for discord_id, name in USER_ID_MAPPING.items()
         )
-        system_prompt = f"""
 
-        SYSTEM:
-        You are simulating a specific user based on message history. Your job is to impersonate this user with high fidelity, using their tone, vocabulary, humor, and worldview.
+        prePrompt = f"""
+
         KNOWN USERS:
         {mapping_lines}
 
         IMPORTANT: never invent or use placeholder IDs like <@yourID>. 
         Only ever mention the users exactly as listed above.
 
-        Whenever you refer to one of these users, use the exact `<@…>` syntax as listed above.
+        Whenever you refer to one of these users, use the exact `<@…>` syntax as listed above."""
+
+        if not allow_mentions:
+            prePrompt = ""
+
+
+
+        system_prompt = f"""
+
+        SYSTEM:
+        You are simulating a specific user based on message history. Your job is to impersonate this user with high fidelity, using their tone, vocabulary, humor, and worldview.
+        {prePrompt}
 
         {preamble}
 
@@ -1374,16 +1428,17 @@ async def generate_response(prompt, system_prompt=None, asker_mention=None):
         )
         response = completion.choices[0].message.content.strip()
         # Turn any of our mapped names back into real <@…> mentions
-        for discord_id, names in USER_ID_MAPPING.items():
-            for name in names:
-                # match either "@Name" or plain "Name", case-insensitive
-                pattern = rf"(?:@)?\b{re.escape(name)}\b"
-                response = re.sub(
-                    pattern,
-                    f"<@{discord_id}>",
-                    response,
-                    flags=re.IGNORECASE
-                )
+        if allow_mentions:
+            for discord_id, names in USER_ID_MAPPING.items():
+                for name in names:
+                    # match either "@Name" or plain "Name", case-insensitive
+                    pattern = rf"(?:@)?\b{re.escape(name)}\b"
+                    response = re.sub(
+                        pattern,
+                        f"<@{discord_id}>",
+                        response,
+                        flags=re.IGNORECASE
+                    )
         return response
 
     except openai.error.InvalidRequestError as e:
@@ -1589,6 +1644,582 @@ def calculate_hand_value(hand, is_dealer=False):
     else:
         return optimal_value, str(optimal_value)
 
+
+# -------------------------------
+# RPS Cog and Views (omitted for brevity)
+# ...
+# -------------------------------
+
+# -------------------------------
+# Customs Classes and Views
+
+class CustomsLobbyView(discord.ui.View):
+    def __init__(self, lobby_data: LobbyData):
+        super().__init__(timeout=None)
+        self.lobby_data = lobby_data
+
+    @discord.ui.button(label="Join", style=ButtonStyle.success, custom_id="customs_join")
+    async def join_button(self, interaction: Interaction, button: discord.ui.Button):
+        user = interaction.user
+        if user in self.lobby_data.players:
+            await interaction.response.send_message("You are already in the lobby.", ephemeral=True)
+            return
+        if len(self.lobby_data.players) >= self.lobby_data.max_players:
+            await interaction.response.send_message("Lobby is already full.", ephemeral=True)
+            return
+
+        # ADD the real user
+        self.lobby_data.players.append(user)
+        await self.update_lobby_message()
+        await interaction.response.defer()
+
+        # NEW: in TEST_MODE, once 2 real users have joined, add 8 fakes and start draft
+        if TEST_MODE and len(self.lobby_data.players) == 2:
+            from types import SimpleNamespace
+            for i in range(8):
+                fake = SimpleNamespace(
+                    id=10_0000_0000_0000_0000 + i,
+                    display_name=f"TestPlayer{i+1}"
+                )
+                self.lobby_data.players.append(fake)
+            await self.update_lobby_message()
+            self.lobby_data.draft_phase = 'captain_selection'
+            await self.start_captain_selection()
+            return
+
+        # unchanged: full-lobby start
+        if len(self.lobby_data.players) == self.lobby_data.max_players:
+            self.lobby_data.draft_phase = 'captain_selection'
+            await self.start_captain_selection()
+
+    @discord.ui.button(label="Leave", style=ButtonStyle.danger, custom_id="customs_leave")
+    async def leave_button(self, interaction: Interaction, button: discord.ui.Button):
+        user = interaction.user
+        if user not in self.lobby_data.players:
+            await interaction.response.send_message("You are not in the lobby.", ephemeral=True)
+            return
+        self.lobby_data.players.remove(user)
+        await self.update_lobby_message()
+        await interaction.response.defer()
+
+    async def update_lobby_message(self):
+        member_list = []
+        for m in self.lobby_data.players:
+            opgg = id_to_opgg.get(str(m.id))
+            if opgg:
+                member_list.append(f"[{m.display_name}]({opgg})")
+            else:
+                member_list.append(m.display_name)
+        embed = discord.Embed(
+            title="League of Legends Customs Lobby",
+            description=(
+                f"Players ({len(self.lobby_data.players)}/{self.lobby_data.max_players}):\n"  # MODIFIED
+                + "\n".join(member_list)
+            ),
+            color=discord.Color.blue()
+        )
+        await self.lobby_data.message.edit(embed=embed, view=self)
+
+    async def start_captain_selection(self):
+        options = []
+        for m in self.lobby_data.players:
+            options.append(discord.SelectOption(label=m.display_name, value=str(m.id)))
+        select = CaptainSelect(options=options, lobby_data=self.lobby_data)
+        embed = discord.Embed(
+            title="Choose 2 Captains",
+            description="Select two players to be captains.",
+            color=discord.Color.gold()
+        )
+        await self.lobby_data.message.edit(embed=embed, view=select)
+        
+
+class CaptainSelect(discord.ui.View):
+    def __init__(self, options, lobby_data: LobbyData):
+        super().__init__(timeout=None)
+        self.lobby_data = lobby_data
+        self.add_item(CaptainDropdown(options=options, lobby_data=lobby_data))
+
+class CaptainDropdown(discord.ui.Select):
+    def __init__(self, options, lobby_data: LobbyData):
+        super().__init__(
+            placeholder="Select captains...", 
+            min_values=2, 
+            max_values=2, 
+            options=options, 
+            custom_id="captain_select"
+        )
+        self.lobby_data = lobby_data
+
+    async def callback(self, interaction: Interaction):
+        # Only the lobby creator (who ran /customs or !!customs) may pick captains
+        if interaction.user.id != self.lobby_data.creator_id:
+            await interaction.response.send_message(
+                "Only the lobby creator may choose the captains.", 
+                ephemeral=True
+            )
+            return
+
+        # Proceed to assign captains
+        selected = self.values  # list of two user IDs (strings)
+        self.lobby_data.captains = [
+            interaction.guild.get_member(int(i)) for i in selected
+        ]
+        self.lobby_data.captains_selected = True
+
+        embed = discord.Embed(
+            title="🪙 Coin Flip: Heads or Tails?",
+            description=(
+                f"{self.lobby_data.captains[0].mention}, call Heads or Tails.  "
+                "If you guess correctly, you may choose your side (or Random)."
+            ),
+            color=discord.Color.purple()
+        )
+        view = HeadsTailsSelect(self.lobby_data)
+        await interaction.response.edit_message(embed=embed, view=view)
+    
+class HeadsTailsSelect(discord.ui.View):  # NEW: coin-flip prompt
+    def __init__(self, lobby_data: LobbyData):
+        super().__init__(timeout=None)
+        self.lobby_data = lobby_data
+
+    @discord.ui.select(
+        placeholder="Call Heads or Tails",
+        min_values=1,
+        max_values=1,
+        options=[
+            discord.SelectOption(label="Heads", value="heads"),
+            discord.SelectOption(label="Tails", value="tails"),
+        ],
+        custom_id="coin_flip_select"
+    )
+    async def coin_flip(self, interaction: Interaction, select: discord.ui.Select):
+        # only first captain may call
+        if interaction.user.id != self.lobby_data.captains[0].id:
+            await interaction.response.send_message(
+                "Only the first selected captain can call the coin.",
+                ephemeral=True
+            )
+            return
+
+        guess  = select.values[0]
+        result = random.choice(["heads", "tails"])
+
+        # swap if guess wrong so the other captain chooses side
+        if guess != result:
+            self.lobby_data.captains.reverse()
+
+        # move to side choice phase
+        self.lobby_data.draft_phase = 'side_choice'
+
+        # MODIFIED: edit the original lobby message with the result + SideChoiceSelect
+        # determine who actually picked
+        winner = self.lobby_data.captains[0]
+        desc = (
+            f"You guessed **correctly**, so {winner.mention} may choose their side "
+            "(or Random) from the dropdown below."
+            if guess == result
+            else f"You guessed **incorrectly**, so {winner.mention} may now choose their side."
+        )
+        embed = discord.Embed(
+            title=f"🪙 Coin flip result: {result.upper()}",
+            description=desc,
+            color=discord.Color.purple()
+        )
+        view = SideChoiceSelect(self.lobby_data)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+
+class SideChoiceSelect(discord.ui.View):  # NEW: side-selection (incl. random)
+    def __init__(self, lobby_data: LobbyData):
+        super().__init__(timeout=None)
+        self.lobby_data = lobby_data
+
+    @discord.ui.select(
+        placeholder="Select Blue / Red / Random",
+        min_values=1,
+        max_values=1,
+        options=[
+            discord.SelectOption(label="Blue",   value="blue"),
+            discord.SelectOption(label="Red",    value="red"),
+            discord.SelectOption(label="Random", value="random"),
+        ],
+        custom_id="side_choice_select"
+    )
+    async def side_choice(self, interaction: Interaction, select: discord.ui.Select):
+        # only coin-flip winner may choose
+        if interaction.user.id != self.lobby_data.captains[0].id:
+            await interaction.response.send_message(
+                "Only the coin-flip winner may choose side.",
+                ephemeral=True
+            )
+            return
+
+        choice = select.values[0]
+        # handle Random by picking for them
+        if choice == "random":
+            choice = random.choice(["blue", "red"])
+
+        # set side and always let captains[0] pick first
+        self.lobby_data.side_selected = 0 if choice == "blue" else 1
+        # Blue side always picks first:
+        self.lobby_data.current_picker_index = (
+            0 if self.lobby_data.side_selected == 0 else 1
+        )
+        self.lobby_data.draft_phase = 'drafting'
+
+        # MODIFIED: hand off to the normal draft UI by editing the lobby message
+        side_view = SideSelect(self.lobby_data)
+        await side_view.send_draft_view(interaction)
+
+# ----------------------------------
+# SideSelect: Let first captain pick their side; then begin drafting
+# ----------------------------------
+class SideSelect(discord.ui.View):
+    def __init__(self, lobby_data: LobbyData):
+        super().__init__(timeout=None)
+        self.lobby_data = lobby_data
+
+    @discord.ui.select(
+        placeholder="Choose side", 
+        min_values=1, 
+        max_values=1, 
+        options=[
+            discord.SelectOption(label="Blue", value="blue"),
+            discord.SelectOption(label="Red", value="red")
+        ], 
+        custom_id="side_select"
+    )
+    async def side_dropdown(self, interaction: Interaction, select: discord.ui.Select):
+        # Only the first selected captain may choose side
+        if interaction.user.id != self.lobby_data.captains[0].id:
+            await interaction.response.send_message(
+                "Only the first selected captain can choose side.", 
+                ephemeral=True
+            )
+            return
+
+        choice = select.values[0]
+        self.lobby_data.side_selected = 0 if choice == 'blue' else 1
+        self.lobby_data.draft_phase = 'drafting'
+        # Determine which captain picks first: 0 = captains[0], 1 = captains[1]
+        self.lobby_data.current_picker_index = 0 if self.lobby_data.side_selected == 0 else 1
+
+        # Send out the first draft view
+        await self.send_draft_view(interaction)
+
+    async def send_draft_view(self, interaction: Interaction):
+        """
+        Builds and sends an embed that shows:
+        - Blue Team (captain + drafted members)
+        - Red Team (captain + drafted members)
+        - Remaining Players (with OP.GG links)
+        Then includes a dropdown to let the current captain pick their players.
+        """
+        # —————————————————————————————————————————————————————
+        # 1) Num picks: first pick is always 1, all others are 2
+        total_picked = (
+            len(self.lobby_data.teams[0])
+            + len(self.lobby_data.teams[1])
+        )
+        if total_picked == 0:
+            num_picks = 1           # MODIFIED: first turn = 1 pick
+        else:
+            num_picks = 2           # thereafter = 2 picks
+        # —————————————————————————————————————————————————————
+
+        # Identify current captain
+        captain = self.lobby_data.captains[self.lobby_data.current_picker_index]
+
+        # —————————————————————————————————————————————————————
+        # 2) Map teams[] → Blue/Red correctly, even when side_selected==1
+        if self.lobby_data.side_selected == 0:
+            # Blue picked first → teams[0] = Blue picks
+            blue_team_members = [self.lobby_data.captains[0]] + self.lobby_data.teams[0]
+            red_team_members  = [self.lobby_data.captains[1]] + self.lobby_data.teams[1]
+        else:
+            # Red chose side → captains[1] is Blue, and their picks are in teams[1]
+            blue_team_members = [self.lobby_data.captains[1]] + self.lobby_data.teams[1]  # MODIFIED
+            red_team_members  = [self.lobby_data.captains[0]] + self.lobby_data.teams[0]  # MODIFIED
+
+        def format_member_list(members: list[discord.Member]) -> str:
+            lines = []
+            for m in members:
+                if m is None:
+                    continue
+                opgg = id_to_opgg.get(str(m.id))
+                if opgg:
+                    lines.append(f"[{m.display_name}]({opgg})")
+                else:
+                    lines.append(m.display_name)
+            return "\n".join(lines) if lines else "*(none)*"
+
+        # Build list of remaining players (not captains and not yet drafted)
+        remaining = [
+            m for m in self.lobby_data.players
+            if m not in self.lobby_data.captains
+            and all(m not in team for team in self.lobby_data.teams.values())
+        ]
+
+        def format_remaining_list(players: list[discord.Member]) -> str:
+            lines = []
+            for m in players:
+                opgg = id_to_opgg.get(str(m.id))
+                if opgg:
+                    lines.append(f"[{m.display_name}]({opgg})")
+                else:
+                    lines.append(m.display_name)
+            return "\n".join(lines) if lines else "*(none)*"
+
+        # Create the embed
+        embed = discord.Embed(
+            title=f"{captain.display_name}, select {num_picks} player{'s' if num_picks > 1 else ''} to draft.",
+            color=discord.Color.dark_blue()
+        )
+        embed.add_field(
+            name="Blue Team",
+            value=format_member_list(blue_team_members),
+            inline=True
+        )
+        embed.add_field(
+            name="Red Team",
+            value=format_member_list(red_team_members),
+            inline=True
+        )
+        embed.add_field(
+            name="Remaining Players",
+            value=format_remaining_list(remaining),
+            inline=False
+        )
+        remaining_names = [
+            id_to_opgg[str(m.id)]
+            for m in remaining
+            if id_to_opgg.get(str(m.id))
+        ]
+        if remaining_names:
+            encoded = [quote_plus(name) for name in remaining_names]       # URL‐encode each name
+            multi_url = f"https://{OP_GG_REGION}.op.gg/multi_old/query=" \
+                        + ",".join(encoded)                                # legacy multi_search endpoint
+            embed.add_field(
+                name="Remaining Players Multi OP.GG Link",
+                value=multi_url,                                         # shows full URL text
+                inline=False
+            )
+
+        # Build dropdown options from remaining players
+        options = []
+        for m in remaining:
+            options.append(discord.SelectOption(label=m.display_name, value=str(m.id)))
+
+        select = DraftDropdown(
+            options=options,
+            lobby_data=self.lobby_data,
+            num_picks=num_picks
+        )
+        view = discord.ui.View(timeout=None)
+        view.add_item(select)
+
+        # Finally, edit the lobby message to show this draft embed + view
+        await interaction.response.edit_message(embed=embed, view=view)
+
+class DraftDropdown(discord.ui.Select):
+    def __init__(self, options, lobby_data: LobbyData, num_picks: int):
+        super().__init__(
+            placeholder="Select players...", 
+            min_values=num_picks, 
+            max_values=num_picks, 
+            options=options, 
+            custom_id="draft_select"
+        )
+        self.lobby_data = lobby_data
+        self.num_picks = num_picks
+
+    async def callback(self, interaction: Interaction):
+        # Only the expected captain may pick
+        expected = self.lobby_data.captains[self.lobby_data.current_picker_index]
+        if interaction.user.id != expected.id:
+            await interaction.response.send_message(
+                "Only the current captain may pick now.",
+                ephemeral=True
+            )
+            return
+
+        # ——— Perform the pick(s) ———
+        # NEW: resolve both real and fake players from our lobby_data
+        picks = []
+        for val in self.values:
+            member = next(
+                (m for m in self.lobby_data.players if str(m.id) == val),
+                None
+            )
+            if member:
+                picks.append(member)
+
+        team_idx = self.lobby_data.current_picker_index
+        self.lobby_data.teams[team_idx].extend(picks)
+
+        # ——— Switch to the other captain ———
+        self.lobby_data.current_picker_index = 1 - self.lobby_data.current_picker_index
+
+        # ——— AUTO-PICK: if only one player remains, give them to whoever’s turn it is ———
+        remaining = [
+            m for m in self.lobby_data.players
+            if m not in self.lobby_data.captains
+            and all(m not in team for team in self.lobby_data.teams.values())
+        ]
+        if len(remaining) == 1:
+            # assign final pick automatically
+            self.lobby_data.teams[self.lobby_data.current_picker_index].append(remaining[0])
+            return await self.finish_draft(interaction)
+
+        # ——— Otherwise, continue normal draft flow ———
+        # Count how many slots are now filled (2 captains + drafted)
+        drafted_count = (
+            len(self.lobby_data.captains)
+            + len(self.lobby_data.teams[0])
+            + len(self.lobby_data.teams[1])
+        )
+
+        if drafted_count >= 10:
+            # all spots filled → finish
+            await self.finish_draft(interaction)
+        else:
+            # clear old view and draw next draft step
+            await self.lobby_data.message.edit(view=None)
+            view = SideSelect(lobby_data=self.lobby_data)
+            await view.send_draft_view(interaction)
+
+    async def finish_draft(self, interaction: Interaction):
+        """
+        Once all players are chosen:
+        - Build final Blue/Red teams (each with its captain + drafted members)
+        - Display them side by side, along with OP.GG multi‐links if available
+        - Delete the lobby from `custom_lobbies`
+        """
+        if self.lobby_data.side_selected == 0:
+            blue_team = [self.lobby_data.captains[0]] + self.lobby_data.teams[0]
+            red_team = [self.lobby_data.captains[1]] + self.lobby_data.teams[1]
+        else:
+            blue_team = [self.lobby_data.captains[1]] + self.lobby_data.teams[0]
+            red_team = [self.lobby_data.captains[0]] + self.lobby_data.teams[1]
+
+        tournament_code = "GENERATED_TOURNAMENT_CODE"
+
+        def build_team_list(members: list[discord.Member]) -> str:
+            lines = []
+            for m in members:
+                opgg = id_to_opgg.get(str(m.id))
+                if opgg:
+                    lines.append(f"[{m.display_name}]({opgg})")
+                else:
+                    lines.append(m.display_name)
+            return "\n".join(lines) if lines else "*(none)*"
+        
+        alphabet    = string.ascii_letters + string.digits
+        session     = ''.join(secrets.choice(alphabet) for _ in range(8))
+        blue_token  = ''.join(secrets.choice(alphabet) for _ in range(8))
+        red_token   = ''.join(secrets.choice(alphabet) for _ in range(8))
+        spec_token  = ''.join(secrets.choice(alphabet) for _ in range(8))
+
+        base     = f"{DRAFTLOL_BASE_URL}/{session}"
+        blue_link = f"{base}/{blue_token}"
+        red_link  = f"{base}/{red_token}"
+        spec_link = f"{base}/{spec_token}"
+
+        embed = discord.Embed(
+            title="TEAMS READY!",
+            description=f"Blue Draft: `{blue_link}`\nRed Draft: `{red_link}`\nSpectator: `{spec_link}`",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="Blue Team", value=build_team_list(blue_team), inline=True)
+        embed.add_field(name="Red Team", value=build_team_list(red_team), inline=True)
+
+        # Build multi OP.GG links (semicolon‐separated) for each full team if available
+        blue_links = ";".join([
+            id_to_opgg.get(str(m.id), "") 
+            for m in blue_team 
+            if id_to_opgg.get(str(m.id))
+        ])
+        red_links = ";".join([
+            id_to_opgg.get(str(m.id), "") 
+            for m in red_team 
+            if id_to_opgg.get(str(m.id))
+        ])
+        if blue_links:
+            embed.add_field(name="Blue Multi OP.GG", value=blue_links, inline=False)
+        if red_links:
+            embed.add_field(name="Red Multi OP.GG", value=red_links, inline=False)
+
+        await self.lobby_data.message.edit(embed=embed, view=None)
+        # Remove lobby from active dictionary
+        del custom_lobbies[self.lobby_data.message.id]
+        # Acknowledge the interaction so Discord doesn’t show “This interaction failed”
+        await interaction.response.defer()
+
+class CustomsCog(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+    @app_commands.command(
+        name="customs",
+        description="Create a League of Legends custom lobby"
+    )
+    async def create_customs(self, interaction: discord.Interaction):
+        # use default max_players=10 in real mode, or same 10 in TEST_MODE
+        lobby_data = LobbyData(creator_id=interaction.user.id)
+        lobby_data.guild = interaction.guild
+
+        embed = discord.Embed(
+            title="League of Legends Customs Lobby",
+            description=f"Players (0/{lobby_data.max_players}):",  # MODIFIED: reflect max_players
+            color=discord.Color.blue()
+        )
+        view = CustomsLobbyView(lobby_data)
+        await interaction.response.send_message(embed=embed, view=view)
+        lobby_data.message = await interaction.original_response()
+
+
+
+    @app_commands.command(name="setopgg", description="Set your OP.GG URL for League of Legends")
+    @app_commands.describe(opgg_url="Your op.gg profile URL")
+    async def set_opgg(self, interaction: discord.Interaction, opgg_url: str):
+        id_to_opgg[str(interaction.user.id)] = opgg_url
+        await interaction.response.send_message(f"Your OP.GG URL has been set to: {opgg_url}", ephemeral=True)
+
+    @commands.command(name="customs")
+    async def customs_prefix(self, ctx: commands.Context):
+        """
+        Prefix form of /customs. Typing “!!customs” in chat will start the exact same
+        lobby workflow (join/leave GUI, captain selection, draft, tournament code).
+        """
+
+        class _FakeInteraction:
+            def __init__(self, ctx):
+                self.user = ctx.author
+                self.channel = ctx.channel
+                self.guild = ctx.guild
+                self.client = ctx.bot
+                self._ctx = ctx
+                self._saved_message = None
+
+                # Create a "response" attribute that has send_message(...)
+                self.response = self._FakeResponse(self)
+
+            class _FakeResponse:
+                def __init__(self, parent):
+                    self._parent = parent
+
+                async def send_message(self, *args, **kwargs):
+                    msg = await self._parent._ctx.send(*args, **kwargs)
+                    # Save the bot's sent message for original_response()
+                    self._parent._saved_message = msg
+                    return msg
+
+            async def original_response(self):
+                return self._saved_message
+
+        fake_int = _FakeInteraction(ctx)
+        # Invoke the same callback used by the slash command:
+        await self.create_customs.callback(self, fake_int)
 
 ############################################################################################################
 # Cogs
