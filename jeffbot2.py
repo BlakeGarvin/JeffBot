@@ -134,22 +134,46 @@ USER_ID_MAPPING = {
 
 
 
+_ready_synced = False
+
 @bot.event
 async def on_ready():
+    global _ready_synced
+    if _ready_synced:
+        return
+    _ready_synced = True
+
     print(f'Logged in as {bot.user}')
+
+    # register your cogs
     await bot.add_cog(SummaryCog(bot))
     await bot.add_cog(GeneralCog(bot))
     if not TEST_MODE:
-        await bot.add_cog(AdminRollCog(bot))  
+        await bot.add_cog(AdminRollCog(bot))
     await bot.add_cog(ShopCog(bot))
     await bot.add_cog(RPSCog(bot))
-    await bot.add_cog(CustomsCog(bot))  # Register the new customs games cog
-    try:
-        synced = await bot.tree.sync()  # Sync slash commands globally
-        print(f"Slash commands synced: {len(synced)} commands.")
-    except Exception as e:
-        print(f"Error syncing slash commands: {e}")
-    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="Big Business"))
+    await bot.add_cog(CustomsCog(bot))
+
+    guild_ids = [
+        1086751625324003369,
+        753949534387961877,
+        1287144786452680744,
+    ]
+
+    for gid in guild_ids:
+        guild = discord.Object(id=gid)
+        bot.tree.clear_commands(guild=guild)       # remove any old guild commands
+        synced = await bot.tree.sync(guild=guild) # push only your guild-decorated commands
+        print(f"Synced {len(synced)} commands to guild {gid}")
+
+    # no global sync here!
+
+    await bot.change_presence(
+        activity=discord.Activity(
+            type=discord.ActivityType.watching,
+            name="Big Business"
+        )
+    )
     await load_messages()
     await load_balances()
     await load_daily_cooldowns()
@@ -846,6 +870,32 @@ class GeneralCog(commands.Cog):
         for cmd, desc in command_list:
             embed.add_field(name=cmd, value=desc, inline=False)
         await interaction.response.send_message(embed=embed)
+
+    @app_commands.command(name="dm", description="Send a direct message to a user via JeffBot")
+    @app_commands.describe(
+        target="User to receive the DM (mention or ID)",
+        content="The message content to send"
+    )
+    async def dm(self, interaction: Interaction, target: discord.User, content: str):
+        """
+        Usage: /dm @SomeUser Hello there!
+        You can also pass a raw ID like /dm 123456789012345678 Hi!
+        """
+        try:
+            # Send the DM
+            await target.send(content)
+            # Confirm in-channel (ephemeral so only the caller sees it)
+            await interaction.response.send_message(
+                f"✅ Message sent to {target.mention}.",
+                ephemeral=True
+            )
+        except Exception as e:
+            await interaction.response.send_message(
+                f"❌ Failed to send DM: {e}",
+                ephemeral=True
+            )
+
+
 
 class SummaryCog(commands.Cog):
     def __init__(self, bot):
@@ -2179,11 +2229,11 @@ class CustomsCog(commands.Cog):
 
 
 
-    @app_commands.command(name="setopgg", description="Set your OP.GG URL for League of Legends")
-    @app_commands.describe(opgg_url="Your op.gg profile URL")
-    async def set_opgg(self, interaction: discord.Interaction, opgg_url: str):
+    @app_commands.command(name="setsumname", description="Set your summoner name for Customs")
+    @app_commands.describe(opgg_url="Your summoner name")
+    async def set_summonername(self, interaction: discord.Interaction, opgg_url: str):
         id_to_opgg[str(interaction.user.id)] = opgg_url
-        await interaction.response.send_message(f"Your OP.GG URL has been set to: {opgg_url}", ephemeral=True)
+        await interaction.response.send_message(f"Your summoner name has been set to: {opgg_url}", ephemeral=True)
 
     @commands.command(name="customs")
     async def customs_prefix(self, ctx: commands.Context):
