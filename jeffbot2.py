@@ -129,6 +129,11 @@ USER_ID_MAPPING = {
     438103809399455745: ["Josh"],
     424431225764184085: ["Willy"],
     241746019765714945: ["Micheal", "Michael"],
+    1286079484830945341: ["Jeff Bot"],
+    191765702670024715: ["Missy"],
+    184481785172721665: ["Jeff"],
+    139938273698119680: ["Chip", "Keon"],
+    1011380418131529769: ["Trey"],
 }
 
 
@@ -199,28 +204,12 @@ async def on_message(message):
         if random.randint(1, SPECIAL_USER_RESPONSE_CHANCE) == 2:
             await message.reply(SPECIAL_USER_RESPONSE)
 
-    # 4. If it’s a prefix command, let the commands extension handle it
+    # 4. Prefix commands
     if message.content.startswith(bot.command_prefix):
         await bot.process_commands(message)
         return
 
-    # 5. Build threaded context by walking up the reply chain
-    chain = []
-    ref = message
-    while ref.reference:
-        # Try the resolved message first, otherwise fetch it manually
-        parent = ref.reference.resolved
-        if parent is None:
-            parent_id = ref.reference.message_id
-            parent_channel = ref.channel
-            parent = await parent_channel.fetch_message(parent_id)
-
-        chain.append(parent)
-        ref = parent
-
-    chain.reverse()
-
-    # 6. Only proceed if this is a mention or a reply to the bot
+    # 5. Only respond when mentioned or replying to Jeff
     is_bot_interaction = (
         bot.user in message.mentions or
         (message.reference
@@ -228,10 +217,9 @@ async def on_message(message):
          and message.reference.resolved.author.id == bot.user.id)
     )
     if not is_bot_interaction:
-        # … your other logic (e.g. “add income”) …
         return
 
-    # 7. Strip the bot mention from the user’s message
+    # 6. Strip the mention off the user’s message
     user_content = (
         message.content
         .replace(f'<@!{bot.user.id}>', '')
@@ -239,44 +227,47 @@ async def on_message(message):
         .strip()
     )
 
-    # 8. Build a proper ChatCompletion “messages” array
-    chat_history = []
-    # (Optional) insert a system prompt here:
-    # chat_history.append({"role": "system", "content": SYSTEM_PROMPT})
+    # 7. Pull in the last 30 messages for channel context
+    hist_entries = []
+    async for hist in message.channel.history(limit=30, before=message, oldest_first=False):
+        # flatten newlines and tag the author
+        content = hist.content.replace('\n', ' ')
+        hist_entries.append(f"<@{hist.author.id}>: {content}")
+    hist_entries.reverse()  # put oldest first
+    hist_context = (
+        "The following 30 messages are the 30 most recent messages sent in this discord conversation, to be used if needed for context: \n"
+        + "\n".join(hist_entries)
+        + "\n\n"
+    )
 
-    # 9. Add each parent reply as its own user turn
-    for m in chain:
-        chat_history.append({
-            "role": "user",
-            "content": f"{m.author.display_name}: {m.content}"
-        })
+    # 8. Build a more precise thread context
+    chain = []
+    ref = message
+    while ref.reference:
+        # resolve parent or fetch if necessary
+        parent = ref.reference.resolved
+        if parent is None:
+            parent = await message.channel.fetch_message(ref.reference.message_id)
+        chain.append(parent)
+        ref = parent
+    chain.reverse()
 
-    # 10. Finally add the actual user’s current message
-    chat_history.append({
-        "role": "user",
-        "content": user_content
-    })
-
-    # 11. Call the OpenAI API, passing asker_mention so Jeff knows who asked
+    reply_context = ""
     if chain:
-        # build a list of lines like:
-        # 'Alice said: "..."'
-        ctx_lines = [
-            f'{m.author.display_name} said: "{m.content}"'
-            for m in chain
-        ]
-        # join them and prefix to the actual question
-        user_content = "This message was sent as a reply to the following messages: " + "\n".join(ctx_lines) + "\n\n" + user_content
+        lines = [f" <@{m.author.id}> said: \"{m.content}\"" for m in chain]
+        reply_context = " Thread context:\n" + "\n".join(lines) + "\n\n"
 
+    # 9. Combine everything into the final prompt
+    final_prompt = hist_context + reply_context + user_content
 
-    # Call the OpenAI API with the enriched prompt
+    # 10. Call the OpenAI API
     response = await generate_response(
-        user_content,
+        final_prompt,
         asker_mention=message.author.mention
     )
     await message.reply(response)
 
-    # 12. Add income for normal user messages
+    # 11. Award “income” for regular messages
     if not message.author.bot:
         await add_income(str(message.author.id), 5)
 
@@ -1386,7 +1377,7 @@ async def generate_response(prompt, system_prompt=None, asker_mention=None, allo
         if asker_mention:
             preamble = (
                 f"The following request was made by {asker_mention}.\n"
-                "When crafting your response, consider how Jeff typically speaks to that user based on chat history. If and only if the request was made by the user with id 806382485276983296/Trent, act super toxic and dismissive to him.\n\n"
+                "When crafting your response, consider how Jeff typically speaks to that user based on chat history.\n\n"
             )
         else:
             preamble = ""
@@ -1426,8 +1417,9 @@ async def generate_response(prompt, system_prompt=None, asker_mention=None, allo
         - The user frequently uses "Mon" as a nickname for anyone, such as how normal people will say "bro" or "dude".
         - The user substitutes the word "Business" in place of other words where contextually appropriate.
         - Interpret their tone from the messages, which is often autisitic and weird and stupuid. 
-        - They see themselves as "white-collar" and look down on "blue-collar" mindsets when someone mentions something being blue-collar.
+        - They see themselves as "white-collar" and look down on "blue-collar" mindsets and "UW"s (union workers).
         - Personality traits are reflected through language and behavior, not descriptions.
+        - You are a discord bot named Jeff Bot, and you are sending your responses in a discord channel, imitating the user.
 
         DATA SOURCE:
         Below is a dataset of the user's messages, which you must learn from:
