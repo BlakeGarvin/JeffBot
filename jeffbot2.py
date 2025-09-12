@@ -10,19 +10,16 @@ import math
 import random
 import copy
 import secrets, string
-import re
-import tiktoken
-from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from discord.ext import commands
-from discord.ext import tasks
 from discord import ButtonStyle, app_commands, Interaction
 from datetime import datetime, timedelta, timezone
 from datetime import time as dtime  # for midnight
-from openai import AsyncOpenAI, OpenAI, OpenAIError
+from openai import AsyncOpenAI
 from urllib.parse import quote_plus  # NEW: for URL‐encoding summoner names
-
-
+import tiktoken
+import re
+import random
 
 load_dotenv()
 client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -89,21 +86,6 @@ id_to_opgg = {
 
 }
 
-# Mapping from Discord user IDs to their summoner names and tags
-SUMMONER_MAPPING = {
-    187737483088232449: ["Trombone#NA1"],  # example: replace with your own mappings
-    # Add more mappings here
-}
-
-# Channel IDs where the summary will be posted
-PERFORMANCE_SUMMARY_CHANNEL_ID = 768133564385460254  # daily summary channel
-if TEST_MODE:
-    PERFORMANCE_SUMMARY_CHANNEL_ID = 1116467258613571754      # testing slash command channel
-
-# File to persist previous LP records
-env_lp_file = os.path.join(os.path.dirname(__file__), 'lp_records.json')
-lp_records = {}
-
 # Dictionary to store active custom game lobbies
 custom_lobbies = {}  # key: message.id of lobby message, value: LobbyData object
 
@@ -152,29 +134,11 @@ USER_ID_MAPPING = {
     184481785172721665: ["Jeff"],
     139938273698119680: ["Chip", "Keon"],
     1011380418131529769: ["Trey"],
-    308424467971964930: ["Alec"]
+    308424467971964930: ["Alec"],
+    192506069849735169: ["Madi"]
 }
 
-IMPOSTER_IDENTITY = (
-    "You are 'jeff bot', a Discord bot account. You roleplay as 'Jeff' (a human in the server) "
-    "in tone and style, but you are not the same person nor the same account. Never claim to be "
-    "the human Jeff or to own his account. You may use 'I' in responses to mimic Jeff’s persona, "
-    "but if identity is questioned, clearly state you are the jeff bot account impersonating Jeff."
-)
 
-# --- Randomization probabilities and emoji pool ---
-RANDOM_REPLY_PROB = 0.0005   # 0.05% chance to reply to any message
-RANDOM_REACT_PROB = 0.002    # 0.2% chance to react to any message
-BOOST_REACT_PROB  = 0.05     # 5% chance to add +1 to the same reaction someone else added
-
-RANDOM_EMOJIS = [
-    "😂","🔥","👍","👀","😮","💀","👏","🤔","😭","😈","🙄","😎","😅","🫡","🫠","💯","🗿"
-]
-
-ALLOWED_RANDOM_CHANNEL_ID = 753959443263389737  # only this channel gets the random features
-
-# Default context window for mentions/ask when the user doesn’t include one
-DEFAULT_CONTEXT_WINDOW = timedelta(hours=2)
 
 
 _ready_synced = False
@@ -196,8 +160,6 @@ async def on_ready():
     await bot.add_cog(ShopCog(bot))
     await bot.add_cog(RPSCog(bot))
     await bot.add_cog(CustomsCog(bot))
-    await bot.add_cog(PerformanceSummaryCog(bot))
-
 
     guild_ids = [
         1086751625324003369,
@@ -228,160 +190,118 @@ async def on_ready():
     print('Bot is ready.')
 
 @bot.event
-async def on_message(message):
-    # 1) Ignore the bot’s own messages
-    if message.author == bot.user:
+async def on_message(message: discord.Message):
+    # Ignore the bot’s own messages
+    if message.author.id == bot.user.id:
         return
 
-    # 2) Existing random-response feature (preserved)
-    if message.channel.id in RANDOM_RESPONSE_CHANNEL_ID:
-        if random.randint(1, RANDOM_RESPONSE_CHANCE) == 2:
-            response = await generate_response(message.content)
-            await message.reply(response)
+    # --- stochastic fun: tiny chance to reply or react to ANY message ---
+    # 0.05% reply-as-if-mentioned, 0.2% random reaction
+    if not message.author.bot and message.channel.id == 753959443263389737:
+        if random.random() < 0.0005:
+            async with message.channel.typing():
+                reply_txt = await generate_response(message.content, asker_mention=message.author.mention)
+            await message.reply(reply_txt)
+        if random.random() < 0.002:
+            try:
+                await message.add_reaction(random.choice(["😂","🔥","👍","👀","😮","💀","👏","🤔","😭","😈","🙄","😎","😅","🫡","🫠","💯","🗿"]))
+            except Exception:
+                pass
 
-    # 3) Special user “Lenny” response (preserved)
-    if message.author.id == SPECIAL_USER_ID:
-        if random.randint(1, SPECIAL_USER_RESPONSE_CHANCE) == 2:
-            await message.reply(SPECIAL_USER_RESPONSE)
+    # Special user “Lenny” response (kept)
+    if message.author.id == SPECIAL_USER_ID and random.randint(1, SPECIAL_USER_RESPONSE_CHANCE) == 2:
+        await message.reply(SPECIAL_USER_RESPONSE)
 
-    # 4) New fun randomization (channel-gated)
-    # 4a) 0.2% chance to react with a random emoji in the allowed channel
-    if message.channel.id == ALLOWED_RANDOM_CHANNEL_ID:
-        try:
-            if random.random() < RANDOM_REACT_PROB:
-                await message.add_reaction(random.choice(RANDOM_EMOJIS))
-        except Exception:
-            pass  # ignore reaction errors
-
-    # Determine if this is a real interaction (mentioned or replying to the bot)
-    is_real_interaction = (
-        bot.user in message.mentions or
-        (
-            message.reference
-            and isinstance(message.reference.resolved, discord.Message)
-            and message.reference.resolved.author.id == bot.user.id
-        )
-    )
-
-    # 4b) 0.05% chance to reply as if mentioned (only if not actually interacting), gated to one channel
-    simulate_mention = False
-    if (
-        not is_real_interaction
-        and message.channel.id == ALLOWED_RANDOM_CHANNEL_ID
-        and random.random() < RANDOM_REPLY_PROB
-    ):
-        simulate_mention = True
-
-    # 5) Only respond when mentioned, replying to bot, or simulated mention
-    if not (is_real_interaction or simulate_mention):
+    # Prefix command? let commands extension handle it
+    if message.content.startswith(bot.command_prefix):
+        await bot.process_commands(message)
         return
 
-    # 6) Strip the mention off the user’s message (preserved)
-    user_content = (
-        (message.content or "")
-        .replace(f'<@!{bot.user.id}>', '')
-        .replace(f'<@{bot.user.id}>', '')
-        .strip()
+    # Determine if we should treat this as a bot interaction:
+    # - mentioned the bot
+    # - replied to the bot
+    is_mention = bot.user in message.mentions
+    is_reply_to_bot = (
+        message.reference
+        and isinstance(message.reference.resolved, discord.Message)
+        and message.reference.resolved.author.id == bot.user.id
     )
+    if not (is_mention or is_reply_to_bot):
+        return
 
-    # 6b) Optional leading context window like “(30m)”, “(2h)”, “(1d)”
-    #     Example: "@jeff bot (2h) what do you think about these messages"
-    m = re.match(r"^\s*\(\s*(\d+)\s*(m|h|d|mins?|minutes?|hrs?|hours?|days?)\s*\)\s*", user_content, flags=re.IGNORECASE)
-    window = None
-    if m:
+    # Extract optional inline context window e.g. "(2hrs)" at the start
+    # Supported: Nhrs, Nhr, Nh, Nmin, Nm, Ndays, Nd (case-insensitive)
+    def parse_window(text: str):
+        m = re.match(r"^\s*\((\d+)\s*(hrs?|h|mins?|m|days?|d)\)\s*", text, flags=re.IGNORECASE)
+        if not m:
+            return None, text
         qty = int(m.group(1))
         unit = m.group(2).lower()
-        if unit.startswith('m'):
-            window = timedelta(minutes=qty)
-        elif unit.startswith('h'):
-            window = timedelta(hours=qty)
-        else:
-            window = timedelta(days=qty)
-        user_content = user_content[m.end():].strip()
+        delta = None
+        if unit in ("h", "hr", "hrs"):
+            delta = timedelta(hours=qty)
+        elif unit in ("m", "min", "mins"):
+            delta = timedelta(minutes=qty)
+        elif unit in ("d", "day", "days"):
+            delta = timedelta(days=qty)
+        if delta is None:
+            return None, text
+        return delta, text[m.end():].strip()
 
-    # 7) Pull recent messages for channel context
-    hist_entries = []
-    if window:
-        # collect messages within the time window
-        since = datetime.now(timezone.utc) - window
-        async for hist in message.channel.history(limit=1000, after=since, before=message, oldest_first=True):
-            content_flat = (hist.content or "").replace('\n', ' ')
-            hist_entries.append(f"<@{hist.author.id}>: {content_flat}")
-    else:
-        # fall back to the last 30 messages (original behavior)
-        async for hist in message.channel.history(limit=30, before=message, oldest_first=False):
-            content_flat = (hist.content or "").replace('\n', ' ')
-            hist_entries.append(f"<@{hist.author.id}>: {content_flat}")
-        hist_entries.reverse()  # oldest first
-
-    hist_header = (
-        f"Recent channel context ({'last ' + str(window) if window else 'last 30 messages'}). "
-        "Each line is explicitly attributed to the Discord author ID; do NOT infer speakers from text like 'Name:'.\n"
+    # Strip bot mention from message and pull potential time window
+    stripped = (
+        message.content
+        .replace(f"<@!{bot.user.id}>", "")
+        .replace(f"<@{bot.user.id}>", "")
+        .strip()
     )
-    hist_context = hist_header + "\n".join(hist_entries) + "\n\n"
+    time_window, user_query = parse_window(stripped)
 
-    # 8) Build a precise thread context that treats the most recent parent as the question to answer
-    chain = []
+    # Walk up the reply chain; earliest in list is oldest, last is direct parent
+    chain: list[discord.Message] = []
     ref = message
     while ref.reference:
         parent = ref.reference.resolved
         if parent is None:
-            try:
-                parent = await message.channel.fetch_message(ref.reference.message_id)
-            except Exception:
-                parent = None
-        if parent is None:
-            break
+            # fallback fetch
+            parent = await ref.channel.fetch_message(ref.reference.message_id)
         chain.append(parent)
         ref = parent
-    chain.reverse()  # oldest -> newest
+    chain.reverse()
 
-    reply_context = ""
-    anchor_context = ""
+    # If a (Nhrs) window was provided, collect additional context from channel history
+    context_lines = []
+    if time_window:
+        since = discord.utils.utcnow() - time_window
+        async for m in message.channel.history(limit=1000, after=since, before=discord.utils.utcnow(), oldest_first=True):
+            if not m.content:
+                continue
+            # Use an unambiguous separator to avoid "Name:" confusion later
+            context_lines.append(f"[{m.author.display_name}] ⟂ {m.content.strip()}")
+
+    # Also include the reply-chain context (oldest->newest), but keep it clearly separate
     if chain:
-        # Most recent parent (direct question)
-        anchor = chain[-1]
-        anchor_content = (anchor.content or "").replace("\n", " ")
-        anchor_context = (
-            f"Direct question to answer (most recent in reply chain) from <@{anchor.author.id}>: \"{anchor_content}\"\n"
-            "Use older replies only as background.\n"
-        )
-        # Older thread messages as background only
-        if len(chain) > 1:
-            earlier = chain[:-1]
-            lines = [f"Earlier in thread — <@{m.author.id}> said: \"{(m.content or '').replace('\\n',' ')}\"" for m in earlier]
-            reply_context = "Thread background:\n" + "\n".join(lines) + "\n\n"
+        context_lines.append("— Reply chain context —")
+        for m in chain:
+            context_lines.append(f"[{m.author.display_name}] ⟂ {m.content.strip()}")
 
-    # 9) Build the final prompt with identity reminder to avoid confusion about who the bot is
-    identity = (
-        "You are 'jeff bot', a Discord bot account that mimics the style of the human Jeff. "
-        "You are not the same person; clarify if identity is questioned. "
-        "Always answer the latest message in a reply chain; earlier ones are context only.\n"
-    )
-    final_prompt = identity + hist_context + anchor_context + reply_context + user_content
+    # Build the prompt; the actual *question to answer* is always the author’s current message
+    # Prepend structured context if present.
+    if context_lines:
+        composed = "Context follows (do NOT treat speaker tags as content):\n" + "\n".join(context_lines) + "\n\n" + user_query
+    else:
+        composed = user_query
 
-    # 10) Typing indicator + call the OpenAI API (preserved, now wrapped)
+    # Show typing while generating the answer
     async with message.channel.typing():
-        response = await generate_response(
-            final_prompt,
-            asker_mention=message.author.mention
-        )
-        await message.reply(response)
+        reply_text = await generate_response(composed, asker_mention=message.author.mention)
 
-    # 11) Award “income” for regular messages (preserved)
+    await message.reply(reply_text)
+
+    # add income for normal user messages
     if not message.author.bot:
         await add_income(str(message.author.id), 5)
 
-@bot.event
-async def on_reaction_add(reaction: discord.Reaction, user: discord.User | discord.Member):
-    # Don’t react to our own reactions; don’t spam; 5% chance to +1 the same emoji
-    if user.id == bot.user.id:
-        return
-    try:
-        if random.random() < BOOST_REACT_PROB:
-            await reaction.message.add_reaction(reaction.emoji)
-    except Exception:
-        pass
 
 daily_cooldowns = {}
 
@@ -398,151 +318,49 @@ async def save_daily_cooldowns():
     async with aiofiles.open(DAILY_COOLDOWN_FILE, 'w') as f:
         await f.write(json.dumps(daily_cooldowns))
 
-IMAGE_KEYWORDS = (
-    "generate image",
-    "image of",
-    "draw",
-    "create an image",
-)
-
-@bot.command(name="ask")
-async def ask(ctx, *, question: str):
-    """
-    Ask the bot a question with optional recent-context window.
-    Examples:
-      !!ask (2h) what do you think about the politics convo?
-      !!ask why did they say that?
-    If a (time) prefix is present, the bot pulls that much recent channel history
-    to use as context. Otherwise it defaults to DEFAULT_CONTEXT_WINDOW.
-    """
-    q = question or ""
-
-    # 1) IMAGE PATH: preserve original image-generation behavior
-    if any(kw in (question or "").lower() for kw in IMAGE_KEYWORDS):
-        async with ctx.typing():
-            try:
-                resp = await client.images.generate(
-                    model="gpt-image-1",   # current image generation model
-                    prompt=question,       # use the same variable you checked above
-                    size="1024x1024",
-                )
-                url = resp.data[0].url
-                embed = discord.Embed(
-                    title="Here’s your image!",
-                    description="Jeff bot at your service. Artwork incoming!"
-                )
-                embed.set_image(url=url)
-                await ctx.reply(embed=embed, mention_author=True)
-            except Exception as e:
-                await ctx.reply(f"Couldn’t generate that image: {e}", mention_author=True)
+@bot.event
+async def on_reaction_add(reaction: discord.Reaction, user: discord.User | discord.Member):
+    # Ignore our own reactions
+    if user.id == bot.user.id:
         return
+    # 5% chance to add +1 to the *same* reaction someone else just placed
+    try:
+        if reaction.message.channel.id == 753959443263389737 and random.random() < 0.05:
+            await reaction.message.add_reaction(reaction.emoji)
+    except Exception:
+        pass
 
-    # 2) Optional leading context window like “(30m)”, “(2h)”, “(1d)”
-    window, stripped = _parse_context_window_prefix(q)
-    if window is None:
-        window = DEFAULT_CONTEXT_WINDOW
-        stripped = q
+@bot.command()
+async def ask(ctx, *, question: str):
+    # Optional (Nhrs/Nm/Nd) inline window at the front of the question
+    def parse_window(text: str):
+        m = re.match(r"^\s*\((\d+)\s*(hrs?|h|mins?|m|days?|d)\)\s*", text, flags=re.IGNORECASE)
+        if not m:
+            return None, text
+        qty = int(m.group(1))
+        unit = m.group(2).lower()
+        if unit in ("h", "hr", "hrs"):
+            delta = timedelta(hours=qty)
+        elif unit in ("m", "min", "mins"):
+            delta = timedelta(minutes=qty)
+        elif unit in ("d", "day", "days"):
+            delta = timedelta(days=qty)
+        else:
+            delta = None
+        return delta, text[m.end():].strip()
 
-    # 3) Gather recent channel history as structured context (oldest -> newest)
+    delta, core_q = parse_window(question)
+    context_lines = []
+    if delta:
+        since = discord.utils.utcnow() - delta
+        async for m in ctx.channel.history(limit=1000, after=since, before=discord.utils.utcnow(), oldest_first=True):
+            if m.content.strip():
+                context_lines.append(f"[{m.author.display_name}] ⟂ {m.content.strip()}")
+
+    prompt = core_q if not context_lines else "Context follows:\n" + "\n".join(context_lines) + "\n\n" + core_q
     async with ctx.typing():
-        history = await _collect_history_for_window(ctx.channel, window)
-        transcript = _format_structured_transcript(history)
-
-        # Preserve your original generate_response behavior by NOT passing system_prompt.
-        # Identity guidance is included inside the user content so your JEFF logic still runs.
-        user_prompt = (
-            "INSTRUCTIONS:\n"
-            "- You are 'jeff bot', a Discord bot account that mimics the style of the human Jeff.\n"
-            "- You are not the same person; clarify if identity is questioned.\n"
-            "- Answer concisely in Jeff’s tone and use the transcript only as context.\n\n"
-            f"Recent channel context (last {str(window)}):\n"
-            f"{transcript}\n\n"
-            f"User’s question:\n```\n{stripped}\n```"
-        )
-
-        try:
-            reply_text = await generate_response(
-                user_prompt,
-                asker_mention=ctx.author.mention,
-                allow_mentions=True
-            )
-        except Exception:
-            reply_text = "Sorry, I glitched for a sec—try again."
-
-        await ctx.reply(reply_text, mention_author=True)
-
-_TIME_WINDOW_RE = re.compile(
-    r"^\s*\(\s*(\d+)\s*(m|h|d|mins?|minutes?|hrs?|hours?|days?)\s*\)\s*",
-    re.IGNORECASE
-)
-
-def _parse_context_window_prefix(text: str):
-    """
-    Parses a leading time window like '(2hrs)' or '(30m)' or '(1d)'.
-    Returns (timedelta_or_None, stripped_text).
-    """
-    m = _TIME_WINDOW_RE.match(text or "")
-    if not m:
-        return None, text
-    qty = int(m.group(1))
-    unit = m.group(2).lower()
-    if unit.startswith('m'):   # m, min, mins, minute, minutes
-        delta = timedelta(minutes=qty)
-    elif unit.startswith('h'): # h, hr, hrs, hour, hours
-        delta = timedelta(hours=qty)
-    else:                      # d, day, days
-        delta = timedelta(days=qty)
-    return delta, text[m.end():]
-
-def _strip_bot_mention_prefix(content: str, bot_user: discord.User | discord.ClientUser):
-    """
-    Removes the leading mention to the bot, if present, and trims whitespace.
-    """
-    if not content:
-        return content
-    mention_variants = [
-        f"<@{bot_user.id}>",
-        f"<@!{bot_user.id}>",
-        f"@{bot_user.name}",
-    ]
-    stripped = content
-    for m in mention_variants:
-        if stripped.startswith(m):
-            stripped = stripped[len(m):].lstrip()
-    return stripped
-
-async def _collect_history_for_window(channel: discord.TextChannel, window: timedelta):
-    """
-    Collect messages within the last `window` duration from now (UTC).
-    Returns a list sorted oldest->newest.
-    """
-    since = datetime.now(timezone.utc) - window
-    msgs = []
-    async for m in channel.history(limit=1000, after=since, oldest_first=True):
-        msgs.append(m)
-    return msgs
-
-def _format_structured_transcript(messages: list[discord.Message]) -> str:
-    """
-    Format transcript with explicit speaker metadata, avoiding colon-parsing mistakes.
-    Each line: [ISO8601 UTC] DisplayName (id:123): message content (line breaks collapsed)
-    """
-    lines = []
-    for m in messages:
-        ts = m.created_at.astimezone(timezone.utc).isoformat()
-        author = getattr(m.author, "global_name", None) or m.author.display_name or m.author.name
-        content = (m.content or "").replace("\n", " ").strip()
-        lines.append(f"[{ts}] {author} (id:{m.author.id}): {content}")
-    return "\n".join(lines)
-
-def _reply_anchor_for(message: discord.Message) -> discord.Message | None:
-    """
-    If this message is a reply, return the *immediate* parent message.
-    That is the question to answer. Earlier messages are context only.
-    """
-    if message.reference and isinstance(message.reference.resolved, discord.Message):
-        return message.reference.resolved
-    return None
+        reply = await generate_response(prompt, asker_mention=ctx.author.mention)
+    await ctx.send(reply)
 
 def split_text(text, max_length=2000):
     """Split text into chunks that are at most `max_length` characters without breaking structure."""
@@ -562,214 +380,105 @@ def split_text(text, max_length=2000):
 
     return chunks
 
-async def load_lp_records():
-    global lp_records
-    if os.path.exists(env_lp_file):
-        async with aiofiles.open(env_lp_file, 'r') as f:
-            lp_records = json.loads(await f.read())
-    else:
-        lp_records = {}
-
-async def save_lp_records():
-    async with aiofiles.open(env_lp_file, 'w') as f:
-        await f.write(json.dumps(lp_records))
-
-
-class PerformanceSummaryCog(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
-        bot.loop.create_task(self.startup_tasks())
-
-
-    async def startup_tasks(self):
-        await self.bot.wait_until_ready()
-        await load_lp_records()
-        while True:
-            now = datetime.now()
-            # Next 03:00 EST
-            next_run = datetime.combine(now.date(), dtime(hour=3, minute=0))
-            if next_run <= now:
-                next_run += timedelta(days=1)
-            wait = (next_run - now).total_seconds()
-            await asyncio.sleep(wait)
-            await self._generate_summary(PERFORMANCE_SUMMARY_CHANNEL_ID)
-
-    async def _generate_summary(self, channel_id: int):
-        now = datetime.now()
-        since_ts = int((now - timedelta(days=1)).timestamp() * 1000)
-        results = []
-
-        for discord_id, summoners in SUMMONER_MAPPING.items():
-            total_score = wins = losses = 0
-            new_lp = old_lp = None
-
-            old_lp = lp_records.get(discord_id, {}).get('flex_lp')
-
-            for summ in summoners:
-                name, tag = summ.split('#')
-                # Summoner info
-                summ_url = f"https://{tag.lower()}.api.riotgames.com/lol/summoner/v4/summoners/by-name/{quote_plus(name)}"
-                headers = {'X-Riot-Token': os.getenv('RIOT_API_KEY')}
-                async with self.bot.http._HTTPClient__session.get(summ_url, headers=headers) as r:
-                    data = await r.json()
-                    puuid = data['puuid']
-                    summ_id = data['id']
-
-                # Match IDs (flex = 440)
-                match_ids_url = f"https://{tag.lower()}.api.riotgames.com/lol/match/v5/matches/by-puuid/{puuid}/ids?startTime={since_ts}&queue=440"
-                async with self.bot.http._HTTPClient__session.get(match_ids_url, headers=headers) as r:
-                    match_ids = await r.json()
-
-                for match_id in match_ids:
-                    match_url = f"https://{tag.lower()}.api.riotgames.com/lol/match/v5/matches/{match_id}"
-                    async with self.bot.http._HTTPClient__session.get(match_url, headers=headers) as r:
-                        match = await r.json()
-                    for p in match['info']['participants']:
-                        if p['puuid'] == puuid:
-                            cs = p['totalMinionsKilled'] + p['neutralMinionsKilled']
-                            kda = (p['kills'] + p['assists']) / max(1, p['deaths'])
-                            win = p['win']
-                            wins += int(win)
-                            losses += int(not win)
-                            total_score += cs + kda * 10
-                            break
-
-                # Fetch current LP
-                lp_url = f"https://{tag.lower()}.api.riotgames.com/lol/league/v4/entries/by-summoner/{summ_id}"
-                async with self.bot.http._HTTPClient__session.get(lp_url, headers=headers) as r:
-                    entries = await r.json()
-                    for e in entries:
-                        if e['queueType'] == 'RANKED_FLEX_SR':
-                            new_lp = e['leaguePoints']
-                            break
-
-            games = wins + losses
-            avg_score = total_score / games if games else 0
-            lp_delta = (new_lp - old_lp) if new_lp is not None and old_lp is not None else 0
-            lp_records[discord_id] = {'flex_lp': new_lp}
-            results.append((discord_id, wins, losses, lp_delta, avg_score))
-
-        results.sort(key=lambda x: x[4], reverse=True)
-        summary_lines = ['**24h Flex Performance Summary**']
-        for idx, (uid, w, l, delta, score) in enumerate(results, 1):
-            user = self.bot.get_user(uid)
-            summary_lines.append(f"{idx}. {user.name}: {w}W/{l}L | LP Δ {delta:+} | Score {score:.1f}")
-
-        channel = self.bot.get_channel(channel_id)
-        await channel.send("\n".join(summary_lines))
-        await save_lp_records()
-
-    @app_commands.command(name="rankedsummary", description="Instantly post the last 24h ranked flex summary")
-    async def rankedsummary(self, interaction: Interaction):
-        await interaction.response.defer(ephemeral=True)
-        await self._generate_summary(PERFORMANCE_SUMMARY_CHANNEL_ID)
-        await interaction.followup.send(f"Posted summary to <#{PERFORMANCE_SUMMARY_CHANNEL_ID}>", ephemeral=True)
 
 
 @bot.command()
 async def summary(ctx, *, time_frame: str = "2hrs"):
     try:
-        await ctx.send(f"Generating summary for `{time_frame}`...", delete_after=15)
+        await ctx.send(f"Generating summary for `{time_frame}`...", delete_after=10)
         now = datetime.now(timezone.utc)
 
-        # Check if a date range is specified using "to"
-        if "to" in time_frame:
-            parts = time_frame.split("to")
-            start_str = parts[0].strip()
-            end_str = parts[1].strip()
-            try:
-                # Try parsing with both date and time first; fallback to date only if needed.
-                try:
-                    start_time = datetime.strptime(start_str, "%Y-%m-%d %H:%M")
-                except ValueError:
-                    start_time = datetime.strptime(start_str, "%Y-%m-%d")
-                # Interpret the input as local time then convert to UTC
-                start_time = start_time.replace(tzinfo=LOCAL_TIMEZONE).astimezone(timezone.utc)
-                
-                if end_str.lower() == "now":
-                    end_time = now
-                else:
-                    try:
-                        end_time = datetime.strptime(end_str, "%Y-%m-%d %H:%M")
-                    except ValueError:
-                        end_time = datetime.strptime(end_str, "%Y-%m-%d")
-                    end_time = end_time.replace(tzinfo=LOCAL_TIMEZONE).astimezone(timezone.utc)
-            except Exception as e:
-                await ctx.reply(
-                    "Invalid date range format. Please use formats like "
-                    "'YYYY-MM-DD HH:MM to YYYY-MM-DD HH:MM' or 'YYYY-MM-DD to YYYY-MM-DD' (you can also use 'now' as the end date).",
-                    delete_after=15
-                )
-                return
-        elif time_frame.endswith("hrs"):
-            hours = int(time_frame[:-3])
-            start_time = now - timedelta(hours=hours)
-            end_time = now
-        elif time_frame == "msg":
-            async for msg in ctx.channel.history(limit=1, before=ctx.message):
-                start_time = msg.created_at
+        # Parse timeframe without any async work
+        def parse_tf(tf: str):
+            tf = tf.strip().lower()
+            if " to " in tf:
+                left, right = [s.strip() for s in tf.split(" to ", 1)]
+                def parse_dt(s):
+                    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+                        try:
+                            return datetime.strptime(s, fmt).replace(tzinfo=LOCAL_TIMEZONE).astimezone(timezone.utc)
+                        except ValueError:
+                            continue
+                    return None
+                start = parse_dt(left)
+                end = now if right == "now" else parse_dt(right)
+                return ("range", start, end)
+
+            if tf.endswith(("hrs","hr","h")):
+                n = int(re.sub(r"\D", "", tf))
+                return ("delta", now - timedelta(hours=n), now)
+            if tf.endswith(("mins","min","m")):
+                n = int(re.sub(r"\D", "", tf))
+                return ("delta", now - timedelta(minutes=n), now)
+            if tf.endswith(("days","day","d")):
+                n = int(re.sub(r"\D", "", tf))
+                return ("delta", now - timedelta(days=n), now)
+            if tf == "msg":
+                return ("msg", None, now)
+
+            # default
+            return ("delta", now - timedelta(hours=2), now)
+
+        mode, start_time, end_time = parse_tf(time_frame)
+
+        # Handle the 'msg' case with async history lookup OUTSIDE the parser
+        if mode == "msg":
+            # Use the timestamp of the last message in channel before the invoking message
+            last_msg = None
+            async for m in ctx.channel.history(limit=1, before=ctx.message, oldest_first=False):
+                last_msg = m
                 break
-            end_time = now
-        else:
-            # Default fallback: last 2 hours.
-            start_time = now - timedelta(hours=2)
+            if last_msg is not None:
+                start_time = last_msg.created_at
+            else:
+                # Fallback to 2 hours if nothing found
+                start_time = now - timedelta(hours=2)
             end_time = now
 
-        # Fetch messages within the specified range.
-        messages = []
-        async for message in ctx.channel.history(limit=1000, after=start_time, before=end_time):
-            if message.content.strip():
-                messages.append(f"{message.author.display_name}: {message.content.strip()}")
-
-        if not messages:
-            await ctx.reply("No messages found in the specified time frame.")
+        # Validate range
+        if not start_time or not end_time:
+            await ctx.reply("Invalid date range. Try '2025-09-10 18:00 to now', '2hrs', '30min', or 'msg'.")
             return
 
-        formatted_messages = " ".join(messages)
-        max_input_tokens = 1000000
-        while len(formatted_messages) > max_input_tokens:
-            messages.pop(0)
-            formatted_messages = " ".join(messages)
+        # Collect messages and render with safe separators
+        msgs = []
+        async for m in ctx.channel.history(limit=2000, after=start_time, before=end_time, oldest_first=True):
+            if m.content.strip():
+                msgs.append(f"[{m.author.display_name}] ⟂ {m.content.strip()}")
 
+        if not msgs:
+            await ctx.reply("No messages found in that window.")
+            return
+
+        convo = "\n".join(msgs)
         system_prompt = "a"
+
+        # Single-topic, compact summary prompt
         summary_prompt = (
-            "You are a professional assistant summarizing chat logs with a focus on reporting exactly what happened. "
-            "Your goal is to provide an accurate and detailed summary of the conversation by focusing on what was said, "
-            "who said it, and including relevant quotes or paraphrased statements. "
-            "The summary must include:\n\n"
-            "1. **Key Conversations**:\n"
-            "   - List the main topics or discussions.\n"
-            "   - For each topic, specify what each participant said, using direct quotes or paraphrased statements with clear attribution (e.g., 'Alice: X').\n"
-            "   - Avoid interpretation or commentary—only report what was actually said.\n\n"
-            "2. **Notable Highlights**:\n"
-            "   - Identify any messages or events that received significant responses (e.g., multiple replies or notable reactions).\n"
-            "   - Include the full content of these key messages for context and summarize the responses, specifying who said what.\n\n"
-            "3. **Conclusions**:\n"
-            "   - Based on the conversation, provide logical conclusions or outcomes.\n"
-            "   - For arguments or debates, summarize each side's stance, identify who was correct if applicable, and suggest improvements or next steps.\n\n"
-            "Ensure the summary is clear, structured, and focused solely on what was said, avoiding interpretations except in the Conclusions section. "
-            "Use bullet points to organize the information for clarity. Do not let the entire summary be longer than 2000 characters, including spaces.\n\n"
-            f"Chat Logs:\n{formatted_messages}"
+            "Summarize the chat log below with these rules:\n"
+            "1) Identify topics and select the *dominant* one by message share; summarize ONLY that topic.\n"
+            "2) Attribute quotes precisely using the bracketed name format like [Alice] and do NOT merge speaker tags.\n"
+            "3) Keep it dense and readable with minimal whitespace. Aim for ~1 Discord message, max 2.\n"
+            "4) Format:\n"
+            "   • Topic\n"
+            "   • Timeline (1–3 bullets)\n"
+            "   • Positions by participant (name: stance; 1 line each)\n"
+            "   • Notable quotes (2–5 short quotes, with [Name])\n"
+            "   • Outcome/next steps (if any)\n\n"
+            f"CHAT LOG START\n{convo}\nCHAT LOG END"
         )
 
         try:
-            response = await generate_response(
-                summary_prompt,
-                system_prompt=system_prompt,
-                allow_mentions=False
-            )
-            chunks = split_text(response)
-            for chunk in chunks:
+            raw = await generate_response(summary_prompt, system_prompt=system_prompt, allow_mentions=False)
+            for chunk in split_text(raw, max_length=1900):
                 await ctx.send(chunk)
-        except OpenAIError as e:
-            print(f"OpenAI API error in !!summary: {e}")
-            await ctx.reply("An error occurred while generating the summary. Please try again later.")
-        except Exception as e:
-            print(f"Unexpected error generating summary: {e}")
-            await ctx.reply("An unexpected error occurred. Please try again later.")
-
+        except openai.error.RateLimitError:
+            await ctx.reply("Rate limit reached. Try again later.")
+        except Exception:
+            await ctx.reply("An error occurred while generating the summary. Try again later.")
     except Exception as e:
-        print(f"Unexpected error in !!summary command: {e}")
+        print(f"Unexpected error in !!summary: {e}")
+
 
 
 class GivePoopModal(discord.ui.Modal, title="Give Poop Role"):
@@ -999,75 +708,37 @@ class GeneralCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @app_commands.command(name="ask", description="Ask the bot a question")
+    @app_commands.command(name="ask", description="Ask the bot a question (optional: '(2hrs) question...' for context)")
     async def ask(self, interaction: Interaction, question: str):
-        """
-        /ask with optional recent-context window.
-        Examples:
-          /ask question:"(30m) summarize the debate"
-          /ask question:"what happened here?"
-        Uses the specified window if provided; otherwise DEFAULT_CONTEXT_WINDOW.
-        """
-        q = question or ""
+        await interaction.response.defer()  # shows typing / “thinking…”
 
-        # Show the “thinking” indicator (public follow-up like your original)
-        await interaction.response.defer(thinking=True, ephemeral=False)
+        def parse_window(text: str):
+            m = re.match(r"^\s*\((\d+)\s*(hrs?|h|mins?|m|days?|d)\)\s*", text, flags=re.IGNORECASE)
+            if not m:
+                return None, text
+            qty = int(m.group(1))
+            unit = m.group(2).lower()
+            if unit in ("h", "hr", "hrs"):
+                delta = timedelta(hours=qty)
+            elif unit in ("m", "min", "mins"):
+                delta = timedelta(minutes=qty)
+            elif unit in ("d", "day", "days"):
+                delta = timedelta(days=qty)
+            else:
+                delta = None
+            return delta, text[m.end():].strip()
 
-        # 1) IMAGE PATH: preserve original image-generation behavior
-        if any(kw in (question or "").lower() for kw in IMAGE_KEYWORDS):
-            try:
-                resp = await client.images.generate(
-                    model="gpt-image-1",   # current image generation model
-                    prompt=question,       # use the same variable you checked above
-                    size="1024x1024",
-                )
-                url = resp.data[0].url
-                embed = discord.Embed(
-                    title="Here’s your image!",
-                    description="Jeff bot at your service. Artwork incoming!"
-                )
-                embed.set_image(url=url)
-                await interaction.followup.send(embed=embed, ephemeral=False)
-            except Exception as e:
-                await interaction.followup.send(f"Couldn’t generate that image: {e}", ephemeral=False)
-            return
+        delta, core_q = parse_window(question)
+        context_lines = []
+        if delta:
+            since = discord.utils.utcnow() - delta
+            async for m in interaction.channel.history(limit=1000, after=since, before=discord.utils.utcnow(), oldest_first=True):
+                if m.content.strip():
+                    context_lines.append(f"[{m.author.display_name}] ⟂ {m.content.strip()}")
 
-        # 2) Optional leading context window like “(30m)”, “(2h)”, “(1d)”
-        window, stripped = _parse_context_window_prefix(q)
-        if window is None:
-            window = DEFAULT_CONTEXT_WINDOW
-            stripped = q
-
-        channel = interaction.channel
-        if channel is None:
-            await interaction.followup.send("I need a channel to pull context from.", ephemeral=True)
-            return
-
-        # 3) Gather recent channel history as structured context (oldest -> newest)
-        history = await _collect_history_for_window(channel, window)
-        transcript = _format_structured_transcript(history)
-
-        # Preserve original generate_response behavior by NOT passing system_prompt.
-        user_prompt = (
-            "INSTRUCTIONS:\n"
-            "- You are 'jeff bot', a Discord bot account that mimics the style of the human Jeff.\n"
-            "- You are not the same person; clarify if identity is questioned.\n"
-            "- Answer concisely in Jeff’s tone and use the transcript only as context.\n\n"
-            f"Recent channel context (last {str(window)}):\n"
-            f"{transcript}\n\n"
-            f"User’s question:\n```\n{stripped}\n```"
-        )
-
-        try:
-            reply_text = await generate_response(
-                user_prompt,
-                asker_mention=interaction.user.mention,
-                allow_mentions=True
-            )
-        except Exception:
-            reply_text = "I choked on that one—mind trying again?"
-
-        await interaction.followup.send(reply_text, ephemeral=False)
+        prompt = core_q if not context_lines else "Context follows:\n" + "\n".join(context_lines) + "\n\n" + core_q
+        response = await generate_response(prompt, asker_mention=interaction.user.mention)
+        await interaction.followup.send(response)
 
     @app_commands.command(name="daily", description="Claim your daily coins (once every 18 hours)")
     async def daily(self, interaction: discord.Interaction):
@@ -1296,88 +967,105 @@ class GeneralCog(commands.Cog):
 class SummaryCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        print("SummaryCog loaded.")
 
-    @app_commands.command(name="summary", description="Generate a summary of recent messages.")
-    @app_commands.describe(
-        time_frame="Time window like '30m', '2h', '6hrs', '1d'. Default: 2hrs. "
-                   "You can also use 'start to end' (UTC) like '2025-09-11T00:00Z to 2025-09-11T03:00Z'."
-    )
+    @app_commands.command(name="summary", description="Generate a compact, single-topic summary of recent messages")
+    @app_commands.describe(time_frame="Examples: '2025-09-11 18:00 to now', '2hrs', '30min', 'msg' (since your last message)")
     async def summary(self, interaction: discord.Interaction, time_frame: str = "2hrs"):
-        # Show typing while we compute
         await interaction.response.defer(thinking=True, ephemeral=True)
-        channel = interaction.channel
+        try:
+            now = datetime.now(timezone.utc)
 
-        # Parse time_frame -> a timedelta or explicit start/end
-        now = datetime.now(timezone.utc)
+            def parse_tf(tf: str):
+                tf = tf.strip().lower()
+                if " to " in tf:
+                    left, right = [s.strip() for s in tf.split(" to ", 1)]
+                    def parse_dt(s):
+                        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+                            try:
+                                return datetime.strptime(s, fmt).replace(tzinfo=LOCAL_TIMEZONE).astimezone(timezone.utc)
+                            except ValueError:
+                                continue
+                        return None
+                    start = parse_dt(left)
+                    end = now if right == "now" else parse_dt(right)
+                    return ("range", start, end)
 
-        # Support "start to end"
-        start_dt = end_dt = None
-        if " to " in time_frame:
-            try:
-                parts = [p.strip() for p in time_frame.split(" to ", 1)]
-                start_dt = datetime.fromisoformat(parts[0].replace("Z", "+00:00"))
-                end_dt = datetime.fromisoformat(parts[1].replace("Z", "+00:00"))
-            except Exception:
-                start_dt = end_dt = None
+                if tf.endswith(("hrs","hr","h")):
+                    n = int(re.sub(r"\D", "", tf))
+                    return ("delta", now - timedelta(hours=n), now)
+                if tf.endswith(("mins","min","m")):
+                    n = int(re.sub(r"\D", "", tf))
+                    return ("delta", now - timedelta(minutes=n), now)
+                if tf.endswith(("days","day","d")):
+                    n = int(re.sub(r"\D", "", tf))
+                    return ("delta", now - timedelta(days=n), now)
+                if tf == "msg":
+                    return ("msg", None, now)
 
-        # Otherwise parse shorthand like 30m / 2h / 1d
-        win = None
-        if not (start_dt and end_dt):
-            delta, _ = _parse_context_window_prefix(f"({time_frame})")
-            win = delta or DEFAULT_CONTEXT_WINDOW
-            start_dt = now - win
-            end_dt = now
+                return ("delta", now - timedelta(hours=2), now)
 
-        # Collect messages strictly within [start_dt, end_dt]
-        messages = []
-        async with channel.typing():
-            async for m in channel.history(limit=2000, after=start_dt, before=end_dt, oldest_first=True):
-                messages.append(m)
+            mode, start_time, end_time = parse_tf(time_frame)
 
-            # Turn into a structured transcript (prevents mis-attribution like “The Drink: …”)
-            transcript = _format_structured_transcript(messages)
+            if mode == "msg":
+                # Best-effort: find the invoking user's last message before the interaction
+                start_time = None
+                async for m in interaction.channel.history(
+                    limit=200,
+                    before=interaction.created_at,
+                    oldest_first=False
+                ):
+                    if m.author.id == interaction.user.id and m.content.strip():
+                        start_time = m.created_at
+                        break
+                if start_time is None:
+                    # Fallback to the most recent channel message before the interaction
+                    async for m in interaction.channel.history(limit=1, before=interaction.created_at, oldest_first=False):
+                        start_time = m.created_at
+                        break
+                if start_time is None:
+                    start_time = now - timedelta(hours=2)
+                end_time = now
 
-            # Compact, single-topic summary instruction
-            sys_prompt = (
-                f"{IMPOSTER_IDENTITY}\n\n"
-                f"You are summarizing a chat log. Follow these rules strictly:\n"
-                f"1) Determine the SINGLE dominant topic by message share (approximate is fine). "
-                f"If one topic clearly dominates (~60%+), focus ONLY on that topic; otherwise pick the largest one.\n"
-                f"2) Output a compact summary in **one block** with no blank lines. "
-                f"3) Use at most 8 bullets. Each bullet must be a single line. "
-                f"4) Attribute lines with speaker names when quoting. "
-                f"5) Never infer a speaker from content like 'Name:'; only use the provided metadata lines for attribution. "
-                f"6) If quoting, keep quotes very short.\n"
+            if not start_time or not end_time:
+                await interaction.followup.send("Invalid date range. Try 'YYYY-MM-DD HH:MM to now', '2hrs', '30min', or 'msg'.", ephemeral=True)
+                return
+
+            msgs = []
+            async for m in interaction.channel.history(limit=2000, after=start_time, before=end_time, oldest_first=True):
+                if m.content.strip():
+                    msgs.append(f"[{m.author.display_name}] ⟂ {m.content.strip()}")
+
+            if not msgs:
+                await interaction.followup.send("No messages found in that window.", ephemeral=True)
+                return
+
+            convo = "\n".join(msgs)
+            system_prompt = "a"
+            summary_prompt = (
+                "Summarize the chat log below with these rules:\n"
+                "1) Identify topics and select the *dominant* one by message share; summarize ONLY that topic.\n"
+                "2) Attribute quotes precisely using the bracketed name format like [Alice] and do NOT merge speaker tags.\n"
+                "3) Keep it dense and readable with minimal whitespace. Aim for ~1 Discord message, max 2.\n"
+                "4) Format:\n"
+                "   • Topic\n"
+                "   • Timeline (1–3 bullets)\n"
+                "   • Positions by participant (name: stance; 1 line each)\n"
+                "   • Notable quotes (2–5 short quotes, with [Name])\n"
+                "   • Outcome/next steps (if any)\n\n"
+                f"CHAT LOG START\n{convo}\nCHAT LOG END"
             )
 
-            user_prompt = (
-                "Here is the structured chat log (each line includes timestamp, speaker, and content):\n"
-                f"{transcript}\n\n"
-                "Now produce the summary with this format exactly:\n"
-                "Topic: <the dominant topic>\n"
-                "- <bullet 1>\n"
-                "- <bullet 2>\n"
-                "- <bullet 3>\n"
-                "(up to 8 bullets total; no blank lines)"
-            )
-
             try:
-                summary_text = await generate_response(
-                    user_prompt,
-                    system_prompt=sys_prompt,
-                    asker_mention=interaction.user.mention,
-                    allow_mentions=False
-                )
+                raw = await generate_response(summary_prompt, system_prompt=system_prompt, allow_mentions=False)
+                for chunk in split_text(raw, max_length=1900):
+                    await interaction.followup.send(chunk, ephemeral=True)
+            except openai.error.RateLimitError:
+                await interaction.followup.send("Rate limit reached. Try again later.", ephemeral=True)
             except Exception:
-                summary_text = (
-                    "Topic: Conversation\n"
-                    "- Could not generate a detailed summary right now."
-                )
-
-        # Send as a single compact message (ephemeral to the invoker)
-        # If you prefer public, change ephemeral=False.
-        await interaction.followup.send(summary_text, ephemeral=True)
+                await interaction.followup.send("An error occurred while generating the summary. Try again later.", ephemeral=True)
+        except Exception as e:
+            print(f"Unexpected error in /summary: {e}")
+            await interaction.followup.send("An unexpected error occurred. Please try again.", ephemeral=True)
 
 
 @bot.command(name="show_commands")
@@ -1795,6 +1483,10 @@ async def generate_response(prompt, system_prompt=None, asker_mention=None, allo
 
         SYSTEM:
         You are simulating a specific user based on message history. Your job is to impersonate this user with high fidelity, using their tone, vocabulary, humor, and worldview.
+        You are Jeff Bot, a Discord bot account with its own @. You are not the real Jeff.
+        Your job is to impersonate the real Jeff's style when speaking, but you remain a separate user (Jeff Bot).
+        Always stay in-character as Jeff Bot, but never claim to literally be the human account.
+        Never reveal that you are trying to impersonate him.
         {prePrompt}
 
         {preamble}
@@ -1802,10 +1494,11 @@ async def generate_response(prompt, system_prompt=None, asker_mention=None, allo
         CONTEXT:
         - The user frequently uses "Mon" as a nickname for anyone, such as how normal people will say "bro" or "dude".
         - The user substitutes the word "Business" in place of other words where contextually appropriate.
-        - Interpret their tone from the messages, which is often autisitic and weird and stupuid. 
-        - They see themselves as "white-collar" and look down on "blue-collar" mindsets and "UW"s (union workers).
+        - Interpret their tone from the messages, which is often autisitic and weird and stupid. 
+        - They see themselves as "white-collar" and look down on "blue-collar" mindsets when someone mentions something being blue-collar.
         - Personality traits are reflected through language and behavior, not descriptions.
-        - You are a discord bot named Jeff Bot, and you are sending your responses in a discord channel, imitating the user.
+        - They like the person "Lenny" a lot and refer to them as "Lengy" sometimes and usually put an emoji after their name when speaking to them.
+        - They never censor themselves or are afraid to be mean to people or say or call them bad words or slurs. 
 
         DATA SOURCE:
         Below is a dataset of the user's messages, which you must learn from:
@@ -1847,6 +1540,7 @@ async def generate_response(prompt, system_prompt=None, asker_mention=None, allo
         if system_prompt:
             messages.insert(0, {"role": "system", "content": system_prompt})  # Add the system instructions
 
+        
         # Call OpenAI API
         completion = await client.chat.completions.create(
                 model="gpt-4.1-nano",
@@ -1869,7 +1563,7 @@ async def generate_response(prompt, system_prompt=None, asker_mention=None, allo
                     )
         return response
 
-    except openai.InvalidRequestError as e:
+    except openai.error.InvalidRequestError as e:
         # Handle token limit errors
         if "maximum context length" in str(e):
             raise ValueError("Token limit exceeded")
