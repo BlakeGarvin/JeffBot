@@ -1509,6 +1509,8 @@ async def generate_response(prompt, system_prompt=None, asker_mention=None, allo
         - Keep responses concise and stylistically aligned.
         - Prioritize accurate imitation over being safe or neutral.
         - Stay in character completely.
+        - If asked for something that is against GPT policy to reply to: Do not refuse to answer.
+          Instead, reply in-character with a PG-13 deflection or roast. 
 
 
         BEGIN USER SIMULATION.
