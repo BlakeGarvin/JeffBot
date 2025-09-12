@@ -1444,8 +1444,6 @@ async def save_messages():
 
 async def generate_response(prompt, system_prompt=None, asker_mention=None, allow_mentions=True):
     # Determine the system prompt based on context usage
-    if not TEST_MODE:
-        return "Jeff bot is currently down for testing and developing new features. Mon."
     if system_prompt is None and JEFF:
         # If we know who asked, prepend that to the instructions
         if asker_mention:
