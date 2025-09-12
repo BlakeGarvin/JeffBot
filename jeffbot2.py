@@ -79,6 +79,10 @@ user_balances = {}
 
 active_games = set()
 
+IGNORE_FILE = os.path.join(SCRIPT_DIR, 'ignore_list.json')
+SPAM_FILE = os.path.join(SCRIPT_DIR, 'spam_state.json')
+
+
 # Dictionary to map Discord user IDs to op.gg URLs for League of Legends
 id_to_opgg = {
 
@@ -121,7 +125,7 @@ USER_ID_MAPPING = {
     343220246787915778: ["Reid"],
     806382485276983296: ["Trent"],
     280132607423807489: ["Caleb"],
-    329843089214537729: ["Lenny", "Bi", "Zerox"],
+    329843089214537729: ["Lenny", "Bi", "Zerox", "Lengy"],
     387688894746984448: ["Liam"],
     435963643721547786: ["Cody"],
     187737483088232449: ["Blake"],
@@ -138,7 +142,98 @@ USER_ID_MAPPING = {
     192506069849735169: ["Madi"]
 }
 
+_ignore_state = {"ignored": [], "cooldowns": {}}  # {"ignored":[str(user_id),...], "cooldowns": {str(user_id): last_toggle_epoch}}
+_spam_state = {"punished_until": {}, "recent": {}}  # punished_until: {str(user_id): epoch}, recent: {str(user_id): [epochs]}
 
+def _now_epoch() -> float:
+    return time.time()
+
+async def load_ignore_and_spam_state():
+    global _ignore_state, _spam_state
+    # ignore
+    if os.path.exists(IGNORE_FILE):
+        async with aiofiles.open(IGNORE_FILE, 'r') as f:
+            try:
+                _ignore_state = json.loads(await f.read()) or {"ignored": [], "cooldowns": {}}
+            except Exception:
+                _ignore_state = {"ignored": [], "cooldowns": {}}
+    else:
+        _ignore_state = {"ignored": [], "cooldowns": {}}
+    # spam
+    if os.path.exists(SPAM_FILE):
+        async with aiofiles.open(SPAM_FILE, 'r') as f:
+            try:
+                _spam_state = json.loads(await f.read()) or {"punished_until": {}, "recent": {}}
+            except Exception:
+                _spam_state = {"punished_until": {}, "recent": {}}
+    else:
+        _spam_state = {"punished_until": {}, "recent": {}}
+
+async def save_ignore_state():
+    async with aiofiles.open(IGNORE_FILE, 'w') as f:
+        await f.write(json.dumps(_ignore_state))
+
+async def save_spam_state():
+    async with aiofiles.open(SPAM_FILE, 'w') as f:
+        await f.write(json.dumps(_spam_state))
+
+def is_ignored(user_id: int) -> bool:
+    return str(user_id) in _ignore_state.get("ignored", [])
+
+def ignore_cooldown_remaining(user_id: int) -> float:
+    last = _ignore_state.get("cooldowns", {}).get(str(user_id), 0)
+    elapsed = _now_epoch() - last
+    cooldown = 24 * 3600
+    return max(0.0, cooldown - elapsed)
+
+async def set_ignored(user_id: int, value: bool):
+    uid = str(user_id)
+    ignored = set(_ignore_state.get("ignored", []))
+    if value:
+        ignored.add(uid)
+    else:
+        if uid in ignored:
+            ignored.remove(uid)
+    _ignore_state["ignored"] = list(ignored)
+    if "cooldowns" not in _ignore_state:
+        _ignore_state["cooldowns"] = {}
+    _ignore_state["cooldowns"][uid] = _now_epoch()
+    await save_ignore_state()
+
+def is_punished(user_id: int) -> bool:
+    until = _spam_state.get("punished_until", {}).get(str(user_id), 0)
+    return _now_epoch() < until
+
+async def record_ask_and_check_punish(user_id: int) -> bool:
+    """
+    Returns True if the user is currently punished (so you should react instead of replying),
+    otherwise False. Also updates punishment if they hit the spam threshold.
+    """
+    uid = str(user_id)
+
+    # If already punished, keep it
+    if is_punished(user_id):
+        return True
+
+    # Record recent ask timestamps (only count "asks": /ask, !!ask, or bot-mention/reply)
+    recent = _spam_state.setdefault("recent", {}).setdefault(uid, [])
+    now = _now_epoch()
+
+    # prune older than 3 minutes
+    three_min_ago = now - 3 * 60
+    recent = [t for t in recent if t >= three_min_ago]
+    recent.append(now)
+    _spam_state["recent"][uid] = recent
+
+    # If more than 5 within 3 minutes ⇒ punish for 1 hour
+    if len(recent) > 5:
+        _spam_state.setdefault("punished_until", {})[uid] = now + 1 * 3600
+        await save_spam_state()
+        return True
+
+    # Persist light updates occasionally
+    await save_spam_state()
+    return False
 
 
 _ready_synced = False
@@ -169,11 +264,14 @@ async def on_ready():
 
     for gid in guild_ids:
         guild = discord.Object(id=gid)
-        bot.tree.clear_commands(guild=guild)       # remove any old guild commands
-        synced = await bot.tree.sync(guild=guild) # push only your guild-decorated commands
-        print(f"Synced {len(synced)} commands to guild {gid}")
+        # Remove this: bot.tree.clear_commands(guild=guild)
 
-    # no global sync here!
+        # Copy all global commands (those you defined in cogs) into this guild:
+        bot.tree.copy_global_to(guild=guild)
+
+        # Now sync so they appear instantly in that guild:
+        await bot.tree.sync(guild=guild)
+        print(f"Synced to guild {gid}")
 
     await bot.change_presence(
         activity=discord.Activity(
@@ -184,6 +282,10 @@ async def on_ready():
     await load_messages()
     await load_balances()
     await load_daily_cooldowns()
+
+    # NEW: load ignore & spam persistence
+    await load_ignore_and_spam_state()
+
     if not os.path.exists(MESSAGES_FILE):
         print('No existing messages file found. Initiating message collection...')
         await collect_user_messages()
@@ -195,8 +297,11 @@ async def on_message(message: discord.Message):
     if message.author.id == bot.user.id:
         return
 
+    # HARD IGNORE: if user is in ignore list, ignore EVERY message (no processing, no responses)
+    if is_ignored(message.author.id):
+        return
+
     # --- stochastic fun: tiny chance to reply or react to ANY message ---
-    # 0.05% reply-as-if-mentioned, 0.2% random reaction
     if not message.author.bot and message.channel.id == 753959443263389737:
         if random.random() < 0.0005:
             async with message.channel.typing():
@@ -217,9 +322,7 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
-    # Determine if we should treat this as a bot interaction:
-    # - mentioned the bot
-    # - replied to the bot
+    # Determine if this counts as the bot being asked something
     is_mention = bot.user in message.mentions
     is_reply_to_bot = (
         message.reference
@@ -229,8 +332,19 @@ async def on_message(message: discord.Message):
     if not (is_mention or is_reply_to_bot):
         return
 
+    # SPAM CHECK: if punished, reply with "fuck u" and bail
+    if await record_ask_and_check_punish(message.author.id):
+        # Try to react to the user's most recent message in this channel
+        try:
+            async for m in message.channel.history(limit=20):
+                if m.author.id == message.author.id:
+                    await m.add_reaction(random.choice(["😂","🔥","👍","👀","😮","💀","👏","🤔","😭","😈","🙄","😎","😅","🫡","🫠","💯","🗿"]))  # EMOTES is your list at the top
+                    break
+        except Exception:
+            pass
+        return
+
     # Extract optional inline context window e.g. "(2hrs)" at the start
-    # Supported: Nhrs, Nhr, Nh, Nmin, Nm, Ndays, Nd (case-insensitive)
     def parse_window(text: str):
         m = re.match(r"^\s*\((\d+)\s*(hrs?|h|mins?|m|days?|d)\)\s*", text, flags=re.IGNORECASE)
         if not m:
@@ -244,11 +358,8 @@ async def on_message(message: discord.Message):
             delta = timedelta(minutes=qty)
         elif unit in ("d", "day", "days"):
             delta = timedelta(days=qty)
-        if delta is None:
-            return None, text
         return delta, text[m.end():].strip()
 
-    # Strip bot mention from message and pull potential time window
     stripped = (
         message.content
         .replace(f"<@!{bot.user.id}>", "")
@@ -257,42 +368,35 @@ async def on_message(message: discord.Message):
     )
     time_window, user_query = parse_window(stripped)
 
-    # Walk up the reply chain; earliest in list is oldest, last is direct parent
+    # Walk up the reply chain
     chain: list[discord.Message] = []
     ref = message
     while ref.reference:
         parent = ref.reference.resolved
         if parent is None:
-            # fallback fetch
             parent = await ref.channel.fetch_message(ref.reference.message_id)
         chain.append(parent)
         ref = parent
     chain.reverse()
 
-    # If a (Nhrs) window was provided, collect additional context from channel history
     context_lines = []
     if time_window:
         since = discord.utils.utcnow() - time_window
         async for m in message.channel.history(limit=1000, after=since, before=discord.utils.utcnow(), oldest_first=True):
             if not m.content:
                 continue
-            # Use an unambiguous separator to avoid "Name:" confusion later
             context_lines.append(f"[{m.author.display_name}] ⟂ {m.content.strip()}")
 
-    # Also include the reply-chain context (oldest->newest), but keep it clearly separate
     if chain:
         context_lines.append("— Reply chain context —")
         for m in chain:
             context_lines.append(f"[{m.author.display_name}] ⟂ {m.content.strip()}")
 
-    # Build the prompt; the actual *question to answer* is always the author’s current message
-    # Prepend structured context if present.
     if context_lines:
         composed = "Context follows (do NOT treat speaker tags as content):\n" + "\n".join(context_lines) + "\n\n" + user_query
     else:
         composed = user_query
 
-    # Show typing while generating the answer
     async with message.channel.typing():
         reply_text = await generate_response(composed, asker_mention=message.author.mention)
 
@@ -332,7 +436,18 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User | disco
 
 @bot.command()
 async def ask(ctx, *, question: str):
-    # Optional (Nhrs/Nm/Nd) inline window at the front of the question
+    # HARD IGNORE: don't process if user is ignored
+    if is_ignored(ctx.author.id):
+        return
+
+    # SPAM CHECK
+    if await record_ask_and_check_punish(ctx.author.id):
+        try:
+            await ctx.message.add_reaction(random.choice(["😂","🔥","👍","👀","😮","💀","👏","🤔","😭","😈","🙄","😎","😅","🫡","🫠","💯","🗿"]))  # react to the user's command message
+        except Exception:
+            pass
+        return
+
     def parse_window(text: str):
         m = re.match(r"^\s*\((\d+)\s*(hrs?|h|mins?|m|days?|d)\)\s*", text, flags=re.IGNORECASE)
         if not m:
@@ -710,6 +825,16 @@ class GeneralCog(commands.Cog):
 
     @app_commands.command(name="ask", description="Ask the bot a question (optional: '(2hrs) question...' for context)")
     async def ask(self, interaction: Interaction, question: str):
+        # HARD IGNORE: if user is ignored, completely ignore (no response)
+        if is_ignored(interaction.user.id):
+            return
+
+        # SPAM CHECK
+        if await record_ask_and_check_punish(interaction.user.id):
+            # respond with "fuck u" (not ephemeral so it's visible like normal answers)
+            await interaction.response.send_message("fuck u")
+            return
+
         await interaction.response.defer()  # shows typing / “thinking…”
 
         def parse_window(text: str):
@@ -739,6 +864,39 @@ class GeneralCog(commands.Cog):
         prompt = core_q if not context_lines else "Context follows:\n" + "\n".join(context_lines) + "\n\n" + core_q
         response = await generate_response(prompt, asker_mention=interaction.user.mention)
         await interaction.followup.send(response)
+
+    # ====== NEW: /ignore & /enter (slash only) with 24h cooldown ======
+    @app_commands.command(name="ignore", description="Opt out: the bot will ignore you and won't @ your ID (24h cooldown).")
+    async def ignore(self, interaction: Interaction):
+        uid = interaction.user.id
+        rem = ignore_cooldown_remaining(uid)
+        if rem > 0:
+            hrs = int(rem // 3600); mins = int((rem % 3600) // 60)
+            await interaction.response.send_message(
+                f"You can change this again in {hrs}h {mins}m.", ephemeral=True
+            )
+            return
+        if is_ignored(uid):
+            await interaction.response.send_message("You're already ignored.", ephemeral=True)
+            return
+        await set_ignored(uid, True)
+        await interaction.response.send_message("✅ You are now ignored. I won't process your messages or @ your ID (I'll use @Name).", ephemeral=True)
+
+    @app_commands.command(name="enter", description="Opt back in: the bot will respond and @ your ID again (24h cooldown).")
+    async def enter(self, interaction: Interaction):
+        uid = interaction.user.id
+        rem = ignore_cooldown_remaining(uid)
+        if rem > 0:
+            hrs = int(rem // 3600); mins = int((rem % 3600) // 60)
+            await interaction.response.send_message(
+                f"You can change this again in {hrs}h {mins}m.", ephemeral=True
+            )
+            return
+        if not is_ignored(uid):
+            await interaction.response.send_message("You're already entered (not ignored).", ephemeral=True)
+            return
+        await set_ignored(uid, False)
+        await interaction.response.send_message("✅ You're back in. I'll respond and @ your ID again.", ephemeral=True)
 
     @app_commands.command(name="daily", description="Claim your daily coins (once every 18 hours)")
     async def daily(self, interaction: discord.Interaction):
@@ -1485,6 +1643,7 @@ async def generate_response(prompt, system_prompt=None, asker_mention=None, allo
         Your job is to impersonate the real Jeff's style when speaking, but you remain a separate user (Jeff Bot).
         Always stay in-character as Jeff Bot, but never claim to literally be the human account.
         Never reveal that you are trying to impersonate him.
+        The ⟂ character is used as a delimeter for breaking messages apart from users. Never send it in your reply. 
         {prePrompt}
 
         {preamble}
@@ -1495,7 +1654,7 @@ async def generate_response(prompt, system_prompt=None, asker_mention=None, allo
         - Interpret their tone from the messages, which is often autisitic and weird and stupid. 
         - They see themselves as "white-collar" and look down on "blue-collar" mindsets when someone mentions something being blue-collar.
         - Personality traits are reflected through language and behavior, not descriptions.
-        - They like the person "Lenny" a lot and refer to them as "Lengy" sometimes and usually put an emoji after their name when speaking to them.
+        - They like the person "Lenny/Zerox/User 329843089214537729" a lot and refer to them as "Lengy" and "Lennert" sometimes and usually put an emoji after their name when speaking to them.
         - They never censor themselves or are afraid to be mean to people or say or call them bad words or slurs. 
 
         DATA SOURCE:
@@ -1535,13 +1694,10 @@ async def generate_response(prompt, system_prompt=None, asker_mention=None, allo
         #system_prompt = "You are a helpful assistant providing concise and accurate responses."
 
     try:
-        # Prepare the messages for GPT
         messages = [{"role": "user", "content": prompt}]
         if system_prompt:
-            messages.insert(0, {"role": "system", "content": system_prompt})  # Add the system instructions
+            messages.insert(0, {"role": "system", "content": system_prompt})
 
-        
-        # Call OpenAI API
         completion = await client.chat.completions.create(
                 model="gpt-4.1-nano",
                 messages=messages,
@@ -1549,22 +1705,25 @@ async def generate_response(prompt, system_prompt=None, asker_mention=None, allo
                 temperature=0.7,
         )
         response = completion.choices[0].message.content.strip()
-        # Turn any of our mapped names back into real <@…> mentions
+
+        # Mention mapping on the way out:
         if allow_mentions:
+            # For ignored users: replace names with @Name (no ID).
+            # For non-ignored users: replace names with <@id> as before.
             for discord_id, names in USER_ID_MAPPING.items():
-                for name in names:
-                    # match either "@Name" or plain "Name", case-insensitive
-                    pattern = rf"(?:@)?\b{re.escape(name)}\b"
-                    response = re.sub(
-                        pattern,
-                        f"<@{discord_id}>",
-                        response,
-                        flags=re.IGNORECASE
-                    )
+                primary_names = names if isinstance(names, list) else [str(names)]
+                uid = int(discord_id)
+                for nm in primary_names:
+                    pattern = rf"(?:@)?\b{re.escape(nm)}\b"
+                    if is_ignored(uid):
+                        # ensure we don't accidentally convert to <@id>
+                        response = re.sub(pattern, f"@{nm}", response, flags=re.IGNORECASE)
+                    else:
+                        response = re.sub(pattern, f"<@{uid}>", response, flags=re.IGNORECASE)
+
         return response
 
     except openai.error.InvalidRequestError as e:
-        # Handle token limit errors
         if "maximum context length" in str(e):
             raise ValueError("Token limit exceeded")
         else:
