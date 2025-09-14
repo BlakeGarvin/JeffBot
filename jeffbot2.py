@@ -294,21 +294,23 @@ async def on_ready():
 @bot.event
 async def on_message(message: discord.Message):
     # Ignore the bot’s own messages
-    if message.author.id == bot.user.id:
-        return
+    # if message.author.id == bot.user.id:
+    #     return
 
     # HARD IGNORE: if user is in ignore list, ignore EVERY message (no processing, no responses)
     if is_ignored(message.author.id):
         return
 
     # --- stochastic fun: tiny chance to reply or react to ANY message ---
-    if not message.author.bot and message.channel.id == 753959443263389737:
-        if random.random() < 0.0005:
+    if message.channel.id == 753959443263389737:
+        if random.random() < 0.0007:
+            print("REPLY ROLLED")
             async with message.channel.typing():
                 reply_txt = await generate_response(message.content, asker_mention=message.author.mention)
             await message.reply(reply_txt)
-        if random.random() < 0.002:
+        if random.random() < 0.005:
             try:
+                print("NEW REACTION ROLLED")
                 await message.add_reaction(random.choice(["😂","🔥","👍","👀","😮","💀","👏","🤔","😭","😈","🙄","😎","😅","🫡","🫠","💯","🗿"]))
             except Exception:
                 pass
@@ -423,16 +425,33 @@ async def save_daily_cooldowns():
         await f.write(json.dumps(daily_cooldowns))
 
 @bot.event
-async def on_reaction_add(reaction: discord.Reaction, user: discord.User | discord.Member):
-    # Ignore our own reactions
-    if user.id == bot.user.id:
+async def on_raw_reaction_add(payload):
+    # ignore the bot itself
+    if payload.user_id == bot.user.id:
         return
-    # 5% chance to add +1 to the *same* reaction someone else just placed
+
+    # limit to your channel(s). Option A: single channel id
+    if payload.channel_id != 753959443263389737:
+        return
+    
+
+    # roll the same 5% chance as before
+    if random.random() >= 0.05:
+        return
+    print("REACTION ROLLED")
+    # fetch channel/message because raw events don't include full objects
+    channel = bot.get_channel(payload.channel_id) or await bot.fetch_channel(payload.channel_id)
     try:
-        if reaction.message.channel.id == 753959443263389737 and random.random() < 0.05:
-            await reaction.message.add_reaction(reaction.emoji)
+        message = await channel.fetch_message(payload.message_id)
     except Exception:
-        pass
+        return  # can't fetch (no perms / deleted / etc.)
+
+    # add the SAME emoji that was just added
+    emoji = str(payload.emoji)  # works for unicode; for custom, PartialEmoji -> str is fine
+    try:
+        await message.add_reaction(emoji)
+    except Exception:
+        pass  # ignore failures (permissions, invalid emoji, etc.)
 
 @bot.command()
 async def ask(ctx, *, question: str):
