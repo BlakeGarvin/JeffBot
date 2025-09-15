@@ -122,8 +122,8 @@ SPECIAL_USER_RESPONSE_CHANCE = 50  # 10% chance
 SPECIAL_USER_RESPONSE = "Lenny 😋"
 
 SPAM_WINDOWS = [
-    (5, 3 * 60),    # 5 in 3 minutes
-    (7, 10 * 60),   # 7 in 10 minutes
+    (5, 5 * 60),    # 5 in 5 minutes
+    (7, 15 * 60),   # 7 in 15 minutes
 ]
 
 
