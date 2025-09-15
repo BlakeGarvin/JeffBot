@@ -576,6 +576,8 @@ async def on_message(message: discord.Message):
     async with message.channel.typing():
         reply_text = await generate_response(composed, asker_mention=message.author.mention)
 
+    reply_text = normalize_visible_ats(normalize_mentions_raw(reply_text))
+
     await message.reply(reply_text)
 
     # add income for normal user messages
@@ -668,6 +670,7 @@ async def ask(ctx, *, question: str):
     prompt = core_q if not context_lines else "Context follows:\n" + "\n".join(context_lines) + "\n\n" + core_q
     async with ctx.typing():
         reply = await generate_response(prompt, asker_mention=ctx.author.mention)
+    reply = normalize_visible_ats(normalize_mentions_raw(reply))
     await ctx.send(reply)
 
 def split_text(text, max_length=2000):
@@ -1056,6 +1059,7 @@ class GeneralCog(commands.Cog):
 
         prompt = core_q if not context_lines else "Context follows:\n" + "\n".join(context_lines) + "\n\n" + core_q
         response = await generate_response(prompt, asker_mention=interaction.user.mention)
+        response = normalize_visible_ats(normalize_mentions_raw(response))
         await interaction.followup.send(response)
 
     # ====== /disable and /enable from parky blake or garret ======
