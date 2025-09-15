@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from datetime import time as dtime  # for midnight
 from openai import AsyncOpenAI
 from urllib.parse import quote_plus  # NEW: for URL‐encoding summoner names
+from typing import Optional
 import tiktoken
 import re
 import random
@@ -151,6 +152,10 @@ USER_ID_MAPPING = {
     308424467971964930: ["Alec"],
     192506069849735169: ["Madi"]
 }
+
+MENTION_SEP = "::"
+
+
 
 _ignore_state = {"ignored": [], "cooldowns": {}}  # {"ignored":[str(user_id),...], "cooldowns": {str(user_id): last_toggle_epoch}}
 _spam_state = {"punished_until": {}, "recent": {}}  # punished_until: {str(user_id): epoch}, recent: {str(user_id): [epochs]}
@@ -295,6 +300,108 @@ async def record_ask_and_check_punish(user_id: int) -> bool:
     await save_spam_state()
     return False
 
+def _canonical_name(user_id: int) -> str:
+    """Map a Discord user id to a readable canonical name, falling back to 'User-<id>'."""
+    names = USER_ID_MAPPING.get(user_id)
+    if names and len(names) > 0:
+        return names[0]
+    return f"User-{user_id}"
+
+def normalize_mentions_raw(text: str) -> str:
+    """
+    Replace any raw <@123> or <@!123> mentions with @Name using USER_ID_MAPPING.
+    This prevents GPT from seeing ID mentions and from thinking @Jeff Bot means 'talk about yourself'.
+    """
+    if not text:
+        return text
+
+    def _repl(m):
+        uid = int(m.group("id"))
+        return "@" + _canonical_name(uid)
+
+    # <@123> or <@!123>
+    text = re.sub(r"<@!? (?P<id>\d+) >".replace(" ", ""), _repl, text)
+    return text
+
+def normalize_visible_ats(text: str) -> str:
+    """
+    Also normalize visible '@Jeff Bot' / '@Name' when the name matches the bot or a user in the map.
+    This keeps '@Jeff Bot' from causing the model to self-reference. We keep it as plain text, no ping.
+    """
+    if not text:
+        return text
+
+    # Replace common bot self-mentions to plain text (no ping)
+    # (Covers '@Jeff Bot', '@JeffBot', '@Jeff  Bot' variations)
+    text = re.sub(r"@?\s*Jeff\s*Bot\b", "Jeff Bot", text, flags=re.IGNORECASE)
+
+    # Optional: collapse double spaces left by replacements
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    return text
+
+
+
+
+async def build_reply_chain(start_message: discord.Message, max_depth: Optional[int] = None) -> list[discord.Message]:
+    """
+    Walk up the reply chain from the user's message to the root.
+    Returns a list oldest->newest (excluding the user's current message).
+    max_depth=None means unlimited.
+    """
+    chain: list[discord.Message] = []
+    ref = start_message
+    depth = 0
+
+    while getattr(ref, "reference", None):
+        if max_depth is not None and depth >= max_depth:
+            break
+
+        parent = ref.reference.resolved
+        if parent is None:
+            try:
+                parent = await ref.channel.fetch_message(ref.reference.message_id)
+            except Exception:
+                break  # couldn't fetch; stop
+
+        chain.append(parent)
+        ref = parent
+        depth += 1
+
+    chain.reverse()  # oldest -> newest
+    return chain
+
+
+def format_block(title: str, lines: list[str]) -> str:
+    if not lines:
+        return ""
+    return (
+        f"BEGIN_{title}\n"
+        "Rules: Lines are '[DisplayName] :: message'. Mentions are plain text (@Name), do NOT ping IDs. "
+        "Do not quote or echo this block; it is context only.\n"
+        + "\n".join(lines) +
+        f"\nEND_{title}\n"
+    )
+
+async def build_recent_context_block(channel: discord.TextChannel, delta: timedelta) -> str:
+    since = discord.utils.utcnow() - delta
+    msgs: list[str] = []
+    async for m in channel.history(limit=1000, after=since, before=discord.utils.utcnow(), oldest_first=True):
+        if not m.content:
+            continue
+        content = normalize_visible_ats(normalize_mentions_raw(m.content.strip()))
+        msgs.append(f"[{m.author.display_name}] {MENTION_SEP} {content}")
+    return format_block(f"RECENT_CONTEXT_LAST_{int(delta.total_seconds())}_SECS", msgs)
+
+def format_reply_chain_block(chain_msgs: list[discord.Message]) -> str:
+    lines: list[str] = []
+    for m in chain_msgs:
+        if not m.content:
+            continue
+        content = normalize_visible_ats(normalize_mentions_raw(m.content.strip()))
+        lines.append(f"[{m.author.display_name}] {MENTION_SEP} {content}")
+    return format_block(f"REPLY_CHAIN_LEN_{len(lines)}", lines)
+
+
 
 _ready_synced = False
 
@@ -356,8 +463,8 @@ async def on_ready():
 @bot.event
 async def on_message(message: discord.Message):
     # Ignore the bot’s own messages
-    # if message.author.id == bot.user.id:
-    #     return
+    if message.author.id == bot.user.id:
+        return
 
     # HARD IGNORE: if user is in ignore list, ignore EVERY message (no processing, no responses)
     if is_ignored(message.author.id):
@@ -414,56 +521,57 @@ async def on_message(message: discord.Message):
 
     # Extract optional inline context window e.g. "(2hrs)" at the start
     def parse_window(text: str):
+        """
+        Recognizes '(2h)', '(30m)', '(3d)' at the start of the message.
+        If none given, defaults to 2 hours.
+        Returns (timedelta, remaining_text).
+        """
         m = re.match(r"^\s*\((\d+)\s*(hrs?|h|mins?|m|days?|d)\)\s*", text, flags=re.IGNORECASE)
-        if not m:
-            return None, text
-        qty = int(m.group(1))
-        unit = m.group(2).lower()
-        delta = None
-        if unit in ("h", "hr", "hrs"):
-            delta = timedelta(hours=qty)
-        elif unit in ("m", "min", "mins"):
-            delta = timedelta(minutes=qty)
-        elif unit in ("d", "day", "days"):
-            delta = timedelta(days=qty)
-        return delta, text[m.end():].strip()
+        if m:
+            qty = int(m.group(1))
+            unit = m.group(2).lower()
+            if unit in ("h", "hr", "hrs"):
+                delta = timedelta(hours=qty)
+            elif unit in ("m", "min", "mins"):
+                delta = timedelta(minutes=qty)
+            else:
+                delta = timedelta(days=qty)
+            return delta, text[m.end():].strip()
+        # DEFAULT: 2 hours when not provided
+        return timedelta(hours=2), text.strip()
 
     stripped = (
         message.content
         .replace(f"<@!{bot.user.id}>", "")
         .replace(f"<@{bot.user.id}>", "")
-        .strip()
     )
+
+    # Normalize mentions in the user's message
+    stripped = normalize_visible_ats(normalize_mentions_raw(stripped))
+
+    # Always returns a delta (default 2h) + the cleaned message to answer
     time_window, user_query = parse_window(stripped)
 
-    # Walk up the reply chain
-    chain: list[discord.Message] = []
-    ref = message
-    while ref.reference:
-        parent = ref.reference.resolved
-        if parent is None:
-            parent = await ref.channel.fetch_message(ref.reference.message_id)
-        chain.append(parent)
-        ref = parent
-    chain.reverse()
+    # Build contexts
+    reply_chain = await build_reply_chain(message, max_depth=None)  # or e.g. 25
+    recent_block = await build_recent_context_block(message.channel, time_window)
+    chain_block  = format_reply_chain_block(reply_chain)
 
-    context_lines = []
-    if time_window:
-        since = discord.utils.utcnow() - time_window
-        async for m in message.channel.history(limit=1000, after=since, before=discord.utils.utcnow(), oldest_first=True):
-            if not m.content:
-                continue
-            context_lines.append(f"[{m.author.display_name}] ⟂ {m.content.strip()}")
+    context_header = (
+        "You are Jeff Bot in a Discord server.\n"
+        "Use context blocks for background only; do not echo them. "
+        "When referring to users, write plain '@Name' text (no ID pings). "
+        "Answer the USER_MESSAGE helpfully and concisely.\n"
+    )
 
-    if chain:
-        context_lines.append("— Reply chain context —")
-        for m in chain:
-            context_lines.append(f"[{m.author.display_name}] ⟂ {m.content.strip()}")
+    parts = [context_header]
+    if recent_block:
+        parts.append(recent_block)
+    if chain_block:
+        parts.append(chain_block)
+    parts.append("USER_MESSAGE_START\n" + (user_query or "").strip() + "\nUSER_MESSAGE_END")
 
-    if context_lines:
-        composed = "Context follows (do NOT treat speaker tags as content):\n" + "\n".join(context_lines) + "\n\n" + user_query
-    else:
-        composed = user_query
+    composed = "\n".join(parts)
 
     async with message.channel.typing():
         reply_text = await generate_response(composed, asker_mention=message.author.mention)
@@ -1762,7 +1870,6 @@ async def generate_response(prompt, system_prompt=None, asker_mention=None, allo
         Your job is to impersonate the real Jeff's style when speaking, but you remain a separate user (Jeff Bot).
         Always stay in-character as Jeff Bot, but never claim to literally be the human account.
         Never reveal that you are trying to impersonate him.
-        The ⟂ character is used as a delimeter for breaking messages apart from users. Never send it in your reply. 
         {prePrompt}
 
         {preamble}
