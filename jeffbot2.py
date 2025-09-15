@@ -82,6 +82,11 @@ active_games = set()
 IGNORE_FILE = os.path.join(SCRIPT_DIR, 'ignore_list.json')
 SPAM_FILE = os.path.join(SCRIPT_DIR, 'spam_state.json')
 
+DISABLE_FILE = os.path.join(SCRIPT_DIR, 'disable_state.json')
+ALLOWED_DISABLE_USERS = {187737483088232449, 133017322800545792, 137776800234209281}
+
+_disable_state = {"until": 0}  # epoch seconds
+
 
 # Dictionary to map Discord user IDs to op.gg URLs for League of Legends
 id_to_opgg = {
@@ -116,6 +121,11 @@ SPECIAL_USER_ID = 329843089214537729  # Specific user for "Lenny 😋" response
 SPECIAL_USER_RESPONSE_CHANCE = 50  # 10% chance
 SPECIAL_USER_RESPONSE = "Lenny 😋"
 
+SPAM_WINDOWS = [
+    (5, 3 * 60),    # 5 in 3 minutes
+    (7, 10 * 60),   # 7 in 10 minutes
+]
+
 
 USER_ID_MAPPING = {
     133017322800545792: ["Parky", "Parker"],
@@ -144,6 +154,52 @@ USER_ID_MAPPING = {
 
 _ignore_state = {"ignored": [], "cooldowns": {}}  # {"ignored":[str(user_id),...], "cooldowns": {str(user_id): last_toggle_epoch}}
 _spam_state = {"punished_until": {}, "recent": {}}  # punished_until: {str(user_id): epoch}, recent: {str(user_id): [epochs]}
+
+def _now_epoch() -> float:
+    return time.time()  # (already defined above; leave your original)
+
+async def load_disable_state():
+    global _disable_state
+    if os.path.exists(DISABLE_FILE):
+        try:
+            async with aiofiles.open(DISABLE_FILE, 'r') as f:
+                _disable_state = json.loads(await f.read()) or {"until": 0}
+        except Exception:
+            _disable_state = {"until": 0}
+    else:
+        _disable_state = {"until": 0}
+
+async def save_disable_state():
+    async with aiofiles.open(DISABLE_FILE, 'w') as f:
+        await f.write(json.dumps(_disable_state))
+
+def is_globally_disabled() -> bool:
+    return _now_epoch() < _disable_state.get("until", 0)
+
+def disable_remaining_seconds() -> int:
+    return max(0, int(_disable_state.get("until", 0) - _now_epoch()))
+
+async def set_disabled_for(seconds: int):
+    _disable_state["until"] = int(_now_epoch() + max(0, seconds))
+    await save_disable_state()
+
+async def clear_disabled():
+    _disable_state["until"] = 0
+    await save_disable_state()
+
+def _parse_duration_to_seconds(s: str | None) -> int:
+    """Accepts '1h', '2hr', '30m', '90min'. Defaults to 1h on bad input."""
+    if not s:
+        return 3600
+    s = s.strip().lower()
+    m = re.match(r"^\s*(\d+)\s*(h|hr|hrs|hour|hours|m|min|mins|minute|minutes)?\s*$", s)
+    if not m:
+        return 3600
+    qty = int(m.group(1))
+    unit = (m.group(2) or "h").lower()
+    if unit.startswith('h'):
+        return qty * 3600
+    return qty * 60
 
 def _now_epoch() -> float:
     return time.time()
@@ -210,28 +266,32 @@ async def record_ask_and_check_punish(user_id: int) -> bool:
     otherwise False. Also updates punishment if they hit the spam threshold.
     """
     uid = str(user_id)
+    now = _now_epoch()
 
-    # If already punished, keep it
+    # If already punished, keep it (same behavior as before)
     if is_punished(user_id):
         return True
 
-    # Record recent ask timestamps (only count "asks": /ask, !!ask, or bot-mention/reply)
+    # Track per-user recent "ask" timestamps (mentions, replies, /ask, !!ask)
     recent = _spam_state.setdefault("recent", {}).setdefault(uid, [])
-    now = _now_epoch()
 
-    # prune older than 3 minutes
-    three_min_ago = now - 3 * 60
-    recent = [t for t in recent if t >= three_min_ago]
+    # Record this ask
     recent.append(now)
-    _spam_state["recent"][uid] = recent
 
-    # If more than 5 within 3 minutes ⇒ punish for 1 hour
-    if len(recent) > 5:
-        _spam_state.setdefault("punished_until", {})[uid] = now + 1 * 3600
-        await save_spam_state()
-        return True
+    # Prune to the longest window we care about so the list stays small
+    max_window = max(w for _, w in SPAM_WINDOWS)
+    cutoff = now - max_window
+    recent[:] = [t for t in recent if t >= cutoff]
 
-    # Persist light updates occasionally
+    # Trip on the first window that’s met or exceeded
+    for limit, window in SPAM_WINDOWS:
+        hits = [t for t in recent if t >= now - window]
+        if len(hits) >= limit:                     # note: >= so "exactly 5" triggers
+            _spam_state.setdefault("punished_until", {})[uid] = now + 60 * 60  # keep your 1h punish
+            await save_spam_state()
+            return True
+
+    # Not punished
     await save_spam_state()
     return False
 
@@ -286,6 +346,8 @@ async def on_ready():
     # NEW: load ignore & spam persistence
     await load_ignore_and_spam_state()
 
+    await load_disable_state()
+
     if not os.path.exists(MESSAGES_FILE):
         print('No existing messages file found. Initiating message collection...')
         await collect_user_messages()
@@ -299,6 +361,10 @@ async def on_message(message: discord.Message):
 
     # HARD IGNORE: if user is in ignore list, ignore EVERY message (no processing, no responses)
     if is_ignored(message.author.id):
+        return
+    
+    # Global disable switch — block all on_message handling for everyone
+    if is_globally_disabled():
         return
 
     # --- stochastic fun: tiny chance to reply or react to ANY message ---
@@ -884,7 +950,41 @@ class GeneralCog(commands.Cog):
         response = await generate_response(prompt, asker_mention=interaction.user.mention)
         await interaction.followup.send(response)
 
-    # ====== NEW: /ignore & /enter (slash only) with 24h cooldown ======
+    # ====== /disable and /enable from parky blake or garret ======
+    @app_commands.command(
+        name="disable",
+        description="Disable the bot from processing messages (default 1h)."
+    )
+    @app_commands.describe(duration="Time like '1h' or '30m' (default 1h)")
+    async def disable(self, interaction: Interaction, duration: str = "1h"):
+        if interaction.user.id not in ALLOWED_DISABLE_USERS:
+            await interaction.response.send_message("You don’t have permission to use this.", ephemeral=True)
+            return
+        seconds = _parse_duration_to_seconds(duration)
+        await set_disabled_for(seconds)
+        mins, secs = divmod(seconds, 60)
+        hrs, mins = divmod(mins, 60)
+        until_ts = datetime.fromtimestamp(_disable_state["until"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        pretty = (f"{hrs}h {mins}m" if hrs else f"{mins}m {secs}s").strip()
+        await interaction.response.send_message(
+            f"🛑 Bot on_message disabled for **{pretty}**.\nIt will auto-re-enable at **{until_ts}**.",
+            ephemeral=True
+        )
+
+    @app_commands.command(
+        name="enable",
+        description="Re-enable bot message processing immediately."
+    )
+    async def enable(self, interaction: Interaction):
+        if interaction.user.id not in ALLOWED_DISABLE_USERS:
+            await interaction.response.send_message("You don’t have permission to use this.", ephemeral=True)
+            return
+        await clear_disabled()
+        await interaction.response.send_message("✅ On_message processing re-enabled.", ephemeral=True)
+
+
+
+    # ====== /ignore & /enter (slash only) with 24h cooldown ======
     @app_commands.command(name="ignore", description="Opt out: the bot will ignore you and won't @ your ID (24h cooldown).")
     async def ignore(self, interaction: Interaction):
         uid = interaction.user.id
