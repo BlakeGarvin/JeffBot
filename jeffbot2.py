@@ -123,7 +123,7 @@ SPECIAL_USER_RESPONSE_CHANCE = 50  # 10% chance
 SPECIAL_USER_RESPONSE = "Lenny 😋"
 
 SPAM_WINDOWS = [
-    (5, 5 * 60),    # 5 in 5 minutes
+    (5, 6 * 60),    # 5 in 5 minutes
     (7, 15 * 60),   # 7 in 15 minutes
 ]
 
@@ -292,7 +292,7 @@ async def record_ask_and_check_punish(user_id: int) -> bool:
     for limit, window in SPAM_WINDOWS:
         hits = [t for t in recent if t >= now - window]
         if len(hits) >= limit:                     # note: >= so "exactly 5" triggers
-            _spam_state.setdefault("punished_until", {})[uid] = now + 60 * 60  # keep your 1h punish
+            _spam_state.setdefault("punished_until", {})[uid] = now + 60 * 60 * 24  # keep your 1h punish
             await save_spam_state()
             return True
 
@@ -324,19 +324,9 @@ def normalize_mentions_raw(text: str) -> str:
     return text
 
 def normalize_visible_ats(text: str) -> str:
-    """
-    Also normalize visible '@Jeff Bot' / '@Name' when the name matches the bot or a user in the map.
-    This keeps '@Jeff Bot' from causing the model to self-reference. We keep it as plain text, no ping.
-    """
-    if not text:
-        return text
-
-    # Replace common bot self-mentions to plain text (no ping)
-    # (Covers '@Jeff Bot', '@JeffBot', '@Jeff  Bot' variations)
-    text = re.sub(r"@?\s*Jeff\s*Bot\b", "Jeff Bot", text, flags=re.IGNORECASE)
-
-    # Optional: collapse double spaces left by replacements
-    text = re.sub(r"\s{2,}", " ", text).strip()
+    text = re.sub(r"(?s)BEGIN_[A-Z0-9_]+.*?END_[A-Z0-9_]+\s*", "", text).strip()
+    # 2) If the model starts like "Jeff Bot :: ..." or "[Name] :: ..."
+    text = re.sub(r"^\s*(?:Jeff\s*Bot|[\[\(]?[^\]\):]+[\]\)]?)\s*::\s*", "", text, flags=re.IGNORECASE)
     return text
 
 
@@ -1847,8 +1837,8 @@ async def generate_response(prompt, system_prompt=None, asker_mention=None, allo
         #safe_print(first_1000_messages)
         # Build a human-readable list of known users → mention IDs
         mapping_lines = "\n".join(
-            f"- {name} → <@{discord_id}>"
-            for discord_id, name in USER_ID_MAPPING.items()
+            f"- {', '.join(names)} → <@{discord_id}>"
+            for discord_id, names in USER_ID_MAPPING.items()
         )
 
         prePrompt = f"""
