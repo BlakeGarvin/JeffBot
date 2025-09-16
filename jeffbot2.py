@@ -378,7 +378,7 @@ async def build_recent_context_block(channel: discord.TextChannel, delta: timede
     async for m in channel.history(limit=1000, after=since, before=discord.utils.utcnow(), oldest_first=True):
         if not m.content:
             continue
-        content = normalize_visible_ats(normalize_mentions_raw(m.content.strip()))
+        content = normalize_visible_ats(m.content.strip())
         msgs.append(f"[{m.author.display_name}] {MENTION_SEP} {content}")
     return format_block(f"RECENT_CONTEXT_LAST_{int(delta.total_seconds())}_SECS", msgs)
 
@@ -387,7 +387,7 @@ def format_reply_chain_block(chain_msgs: list[discord.Message]) -> str:
     for m in chain_msgs:
         if not m.content:
             continue
-        content = normalize_visible_ats(normalize_mentions_raw(m.content.strip()))
+        content = normalize_visible_ats(m.content.strip())
         lines.append(f"[{m.author.display_name}] {MENTION_SEP} {content}")
     return format_block(f"REPLY_CHAIN_LEN_{len(lines)}", lines)
 
@@ -537,7 +537,7 @@ async def on_message(message: discord.Message):
     )
 
     # Normalize mentions in the user's message
-    stripped = normalize_visible_ats(normalize_mentions_raw(stripped))
+    stripped = normalize_visible_ats(stripped)
 
     # Always returns a delta (default 2h) + the cleaned message to answer
     time_window, user_query = parse_window(stripped)
@@ -566,7 +566,7 @@ async def on_message(message: discord.Message):
     async with message.channel.typing():
         reply_text = await generate_response(composed, asker_mention=message.author.mention)
 
-    reply_text = normalize_visible_ats(normalize_mentions_raw(reply_text))
+    reply_text = normalize_visible_ats(reply_text)
 
     await message.reply(reply_text)
 
@@ -660,7 +660,7 @@ async def ask(ctx, *, question: str):
     prompt = core_q if not context_lines else "Context follows:\n" + "\n".join(context_lines) + "\n\n" + core_q
     async with ctx.typing():
         reply = await generate_response(prompt, asker_mention=ctx.author.mention)
-    reply = normalize_visible_ats(normalize_mentions_raw(reply))
+    reply = normalize_visible_ats(reply)
     await ctx.send(reply)
 
 def split_text(text, max_length=2000):
@@ -1049,7 +1049,7 @@ class GeneralCog(commands.Cog):
 
         prompt = core_q if not context_lines else "Context follows:\n" + "\n".join(context_lines) + "\n\n" + core_q
         response = await generate_response(prompt, asker_mention=interaction.user.mention)
-        response = normalize_visible_ats(normalize_mentions_raw(response))
+        response = normalize_visible_ats(response)
         await interaction.followup.send(response)
 
     # ====== /disable and /enable from parky blake or garret ======
