@@ -2,6 +2,7 @@ import discord
 import openai
 import asyncio
 import aiofiles
+import aiohttp
 import os
 import json
 import time
@@ -11,13 +12,16 @@ import random
 import copy
 import secrets, string
 from dotenv import load_dotenv
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import ButtonStyle, app_commands, Interaction
 from datetime import datetime, timedelta, timezone
 from datetime import time as dtime  # for midnight
 from openai import AsyncOpenAI
-from urllib.parse import quote_plus  # NEW: for URL‐encoding summoner names
+from urllib.parse import quote_plus, quote  # NEW: for URL‐encoding summoner names
 from typing import Optional
+from flask import Flask, request
+from flask_cors import CORS
+from threading import Thread
 import tiktoken
 import re
 import random
@@ -38,6 +42,8 @@ TEST_MODE = os.getenv('TEST_MODE')
 
 OP_GG_REGION = "na" 
 DRAFTLOL_BASE_URL = "https://draftlol.dawe.gg"
+
+FLEX_LEADERBOARD_HISTORY_FILE = "flex_leaderboard_history.json"
 
 # List of channel IDs to collect messages from
 TARGET_CHANNEL_IDS = [753959443263389737, 781309198855438336]
@@ -155,6 +161,148 @@ USER_ID_MAPPING = {
 
 MENTION_SEP = "::"
 
+DPM_FLEX_PROFILES = {
+    "Blake": {
+        "puuid": "mV8WBqdnPXtD_grbs_nXqZXCSMfEJhnb1pW11vJXbJO7p6JqzAfbZgCYcND0DVk0R8l5gDX3AxzMOQ",
+        "endpoint": "https://dpm.lol/v1/players/mV8WBqdnPXtD_grbs_nXqZXCSMfEJhnb1pW11vJXbJO7p6JqzAfbZgCYcND0DVk0R8l5gDX3AxzMOQ/match-history?queue=flex",
+    },
+    "Parky": {
+        "puuid": "c1OusXt1PnpBHUcPhYB5tVGxaaJiHtllltrNp_d8PcsXQn-YjhiBuqsziEe6ThzDCtCkebYVV-hIsQ",
+        "endpoint": "https://dpm.lol/v1/players/c1OusXt1PnpBHUcPhYB5tVGxaaJiHtllltrNp_d8PcsXQn-YjhiBuqsziEe6ThzDCtCkebYVV-hIsQ/match-history?queue=flex",
+    },
+    "Josh": {
+        "puuid": "UjiUcaCRKmCMYGQ8i_9u1hVzE5GvwloxPz3vG7jR2mUgSXvItkufi4LJXGZ_54lgHB23evgqnlvNJw",
+        "endpoint": "https://dpm.lol/v1/players/UjiUcaCRKmCMYGQ8i_9u1hVzE5GvwloxPz3vG7jR2mUgSXvItkufi4LJXGZ_54lgHB23evgqnlvNJw/match-history?queue=flex",
+    },
+    "Bi": {
+        "puuid": "pW0cJ9DcXsb3uj0xHwXjDsMHGPIbNEBmESbb8P8wsWli5CgmwjgM4TFPHwpd9HvcwXB7z9FzC06NSw",
+        "endpoint": "https://dpm.lol/v1/players/pW0cJ9DcXsb3uj0xHwXjDsMHGPIbNEBmESbb8P8wsWli5CgmwjgM4TFPHwpd9HvcwXB7z9FzC06NSw/match-history?queue=flex",
+    },
+    "Cody": {
+        "puuid": "GWB6JRRVtuAKYufv6JSR8uY6w--dfpVM45XcM6-PuRqw-IDkamubG7KurtNTP8_jqeLWePFVmDTKuw",
+        "endpoint": "https://dpm.lol/v1/players/GWB6JRRVtuAKYufv6JSR8uY6w--dfpVM45XcM6-PuRqw-IDkamubG7KurtNTP8_jqeLWePFVmDTKuw/match-history?queue=flex",
+    },
+    "Ash": {
+        "puuid": "AgW0-64FECbeS4PPlm5dRcKYsbHUFeozTqvhWYyyNcRUXaRmWRG_wZ9LDuhdkxk7sLxNwf6aUuFEEg",
+        "endpoint": "https://dpm.lol/v1/players/AgW0-64FECbeS4PPlm5dRcKYsbHUFeozTqvhWYyyNcRUXaRmWRG_wZ9LDuhdkxk7sLxNwf6aUuFEEg/match-history?queue=flex",
+    },
+    "Oqi": {
+        "puuid": "I-ZkjIqVkqj64P5pUo5GGC11G2sVwh0ObHmob3MLPYr1ecaAXL5SZ1eZLNfeI4jhgJgp-HA-zAqadA",
+        "endpoint": "https://dpm.lol/v1/players/I-ZkjIqVkqj64P5pUo5GGC11G2sVwh0ObHmob3MLPYr1ecaAXL5SZ1eZLNfeI4jhgJgp-HA-zAqadA/match-history?queue=flex",
+    },
+    "Michael": {
+        "puuid": "WpJkq7RYZU3FE01ehuu-oQhxL_QIJ3MilpVmVvMn9nIjdiRmXCCCPLabOGy70MS4tIL2Fq5133S_3w",
+        "endpoint": "https://dpm.lol/v1/players/WpJkq7RYZU3FE01ehuu-oQhxL_QIJ3MilpVmVvMn9nIjdiRmXCCCPLabOGy70MS4tIL2Fq5133S_3w/match-history?queue=flex",
+    },
+    "Jeff": {
+        "puuid": "oGvNLx9Ie3c6WupoSfiIZJfkwTBBgUBvyQk7JzQQrvZOSRUCMOpt5TvXM8oxHQoZZxo2id4iD-MW0g",
+        "endpoint": "https://dpm.lol/v1/players/oGvNLx9Ie3c6WupoSfiIZJfkwTBBgUBvyQk7JzQQrvZOSRUCMOpt5TvXM8oxHQoZZxo2id4iD-MW0g/match-history?queue=flex",
+    },
+    "Marcus": {
+        "puuid": "lBH-OgFrJw_duwOBue7X_F8G25gdMapoKPyhKihNQOyeqUZqE2N14-IBp6frvIiQ6LHGqGH2uj-XoQ",
+        "endpoint": "https://dpm.lol/v1/players/lBH-OgFrJw_duwOBue7X_F8G25gdMapoKPyhKihNQOyeqUZqE2N14-IBp6frvIiQ6LHGqGH2uj-XoQ/match-history?queue=flex",
+    },
+    # "Parker": { ... },
+    # etc.
+}
+# ---------- DPM Flex leaderboard config ----------
+
+# Map a short display name -> DPM profile info.
+# You fill these in with the correct PUUID and match-history URL.
+# NOTE: Append ?queue=flex (or whatever DPM uses) to limit to Flex only.
+
+
+FLEX_LEADERBOARD_CHANNEL_ID = 753959443263389737
+MIN_FLEX_GAMES_PER_WEEK = 5  # only rank players with at least this many games this week
+FLEX_QUEUE_ID = 440          # DPM uses 440 for Ranked Flex
+MIN_GROUP_PLAYERS_IN_GAME = 4
+dpm_latest_matches_by_profile: dict[str, list[dict]] = {}
+
+# ---------- Flask app to receive DPM data from Tampermonkey ----------
+
+flask_app = Flask(__name__)
+CORS(flask_app, resources={r"/update_dpm": {"origins": "*"}})
+
+
+@flask_app.route("/update_dpm", methods=["POST", "OPTIONS"])
+def update_dpm():
+    """
+    Endpoint that Tampermonkey posts to with DPM match-history data.
+    Expected JSON shape:
+
+      {
+        "profile": "Blake",
+        "puuid": "....",
+        "matches": [ { gameId, gameCreation, queueId, participants: [...], ... }, ... ],
+        "totalCount": 123
+      }
+
+    We store matches keyed by `profile`.
+    """
+    global dpm_latest_matches_by_profile
+
+    if request.method == "OPTIONS":
+        # CORS preflight
+        return ("", 204)
+
+    data = request.get_json(silent=True) or {}
+    profile = data.get("profile") or "UNKNOWN"
+    matches = data.get("matches") or []
+
+    # Store latest batch for this profile
+    dpm_latest_matches_by_profile[profile] = matches
+    print(f"[DPM Relay] Received {len(matches)} matches for profile={profile}")
+
+    return ("", 204)
+
+
+def _run_flask():
+    # Run on localhost:5000 so Tampermonkey can hit it.
+    flask_app.run(host="127.0.0.1", port=5000, debug=False, use_reloader=False)
+
+
+# Start Flask server in a background thread immediately when this module is imported.
+flask_thread = Thread(target=_run_flask, daemon=True)
+flask_thread.start()
+print("[DPM Relay] Flask listener started on http://127.0.0.1:5000/update_dpm")
+
+
+
+
+# ------------- Riot API / League score helpers -------------
+
+RIOT_ROUTING_REGION = "americas"   # cluster for NA match/account endpoints
+RIOT_PLATFORM_REGION = "na1"       # kept for future use (summoner-v4 etc.)
+
+# Hard-wired for now: Schmort#bone (NA)
+RIOT_GAME_NAME = "Schmort"
+RIOT_TAGLINE = "bone"
+
+QUEUE_ID_TO_NAME = {
+    420: "Ranked Solo/Duo",
+    440: "Ranked Flex 5v5",
+    400: "Normal Draft",
+    430: "Normal Blind",
+    450: "ARAM",
+}
+
+ROLE_EXPECTED_DAMAGE_SHARE = {
+    "TOP": 0.22,
+    "JUNGLE": 0.18,
+    "MIDDLE": 0.24,
+    "BOTTOM": 0.28,
+    "UTILITY": 0.08,
+}
+
+ROLE_EXPECTED_CS_PM = {
+    "TOP": 6.5,
+    "JUNGLE": 5.5,
+    "MIDDLE": 7.0,
+    "BOTTOM": 7.5,
+    "UTILITY": 1.5,
+}
+
+EXPECTED_KP = 0.55  # rough "good" kill participation baseline
 
 
 _ignore_state = {"ignored": [], "cooldowns": {}}  # {"ignored":[str(user_id),...], "cooldowns": {str(user_id): last_toggle_epoch}}
@@ -328,6 +476,1292 @@ def normalize_visible_ats(text: str) -> str:
     # 2) If the model starts like "Jeff Bot :: ..." or "[Name] :: ..."
     text = re.sub(r"^\s*(?:Jeff\s*Bot|[\[\(]?[^\]\):]+[\]\)]?)\s*::\s*", "", text, flags=re.IGNORECASE)
     return text
+
+
+async def _riot_get_json(session: aiohttp.ClientSession, url: str, api_key: str) -> dict:
+    """Tiny helper that does a Riot GET with basic error handling."""
+    headers = {"X-Riot-Token": api_key}
+    async with session.get(url, headers=headers) as resp:
+        if resp.status != 200:
+            text = await resp.text()
+            raise RuntimeError(f"Riot API error {resp.status} for {url}: {text[:200]}")
+        return await resp.json()
+    
+
+# ---------- DPM Flex weekly leaderboard helpers ----------
+
+# ---------- DPM Flex Weekly Leaderboard Helpers (using local Tampermonkey data) ----------
+
+def _snapshot_dpm_matches() -> dict[str, list[dict]]:
+    """
+    Take a shallow snapshot of the global matches dict so we don't
+    get weirdness if Flask writes while we're iterating.
+    """
+    global dpm_latest_matches_by_profile
+    snap: dict[str, list[dict]] = {}
+    for k, v in dpm_latest_matches_by_profile.items():
+        snap[k] = list(v)  # shallow copy of list; match dicts reused
+    return snap
+
+def get_last_completed_week_window():
+    """
+    Returns (week_start_utc, week_end_utc, display_start_date, display_end_date)
+
+    Week is defined as:
+      - Start: previous Monday 00:00 local
+      - End: this Monday 00:00 local
+    So it covers Monday-Sunday, and the 'Sunday night at midnight' run
+    is exactly at week_end.
+    """
+    now_local = datetime.now(LOCAL_TIMEZONE)
+
+    today = now_local.date()
+    # Monday = 0 ... Sunday = 6
+    days_since_monday = today.weekday()
+
+    # This Monday 00:00
+    this_monday_local = datetime.combine(
+        today - timedelta(days=days_since_monday),
+        dtime(0, 0),
+        tzinfo=LOCAL_TIMEZONE,
+    )
+
+    # If we're somehow before Monday 00:00 (we shouldn't be), go one week back
+    if now_local < this_monday_local:
+        this_monday_local -= timedelta(days=7)
+
+    week_end_local = this_monday_local
+    week_start_local = week_end_local - timedelta(days=7)
+
+    # Convert to UTC for comparing to gameCreation timestamps
+    week_start_utc = week_start_local.astimezone(timezone.utc)
+    week_end_utc = week_end_local.astimezone(timezone.utc)
+
+    # For display, we show start_date → end_date - 1 day (Mon–Sun)
+    display_start_date = week_start_local.date()
+    display_end_date = (week_end_local - timedelta(days=1)).date()
+
+    return week_start_utc, week_end_utc, display_start_date, display_end_date
+
+
+def load_flex_leaderboard_history() -> dict:
+    """
+    Returns a dict mapping week_key -> list of entries:
+      { "YYYY-MM-DD": [ { "name": str, "games": int, "avg": float }, ... ], ... }
+    """
+    if not os.path.exists(FLEX_LEADERBOARD_HISTORY_FILE):
+        return {}
+    try:
+        with open(FLEX_LEADERBOARD_HISTORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_flex_leaderboard_history(history: dict) -> None:
+    try:
+        with open(FLEX_LEADERBOARD_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2)
+    except Exception as e:
+        print(f"[FlexLB] Error saving history: {e}")
+
+
+async def compute_weekly_flex_leaderboard_from_local() -> tuple[list[dict], datetime.date, datetime.date]:
+    """
+    Compute the weekly Flex leaderboard using the data that the browser
+    (via Tampermonkey) has pushed into dpm_latest_matches_by_profile.
+
+    Week window comes from get_last_completed_week_window().
+
+    A game counts for a player if:
+      - queueId == FLEX_QUEUE_ID (Flex)
+      - gameCreation is within the week window
+      - that game's gameId appears for at least MIN_GROUP_PLAYERS_IN_GAME profiles
+        in DPM_FLEX_PROFILES (i.e., ≥4 of your tracked accounts played that game).
+    """
+    if not DPM_FLEX_PROFILES:
+        week_start_utc, week_end_utc, display_start, display_end = get_last_completed_week_window()
+        return [], display_start, display_end
+
+    week_start_utc, week_end_utc, display_start, display_end = get_last_completed_week_window()
+    week_start_ts = week_start_utc.timestamp()
+    week_end_ts = week_end_utc.timestamp()
+
+    snap = _snapshot_dpm_matches()  # { profile_name: [matches...] }
+
+    # 1) Build gameId -> set of tracked profile names who have that game in this week
+    game_to_profiles: dict[int, set[str]] = {}
+
+    for name, matches in snap.items():
+        if name not in DPM_FLEX_PROFILES:
+            continue
+
+        for m in matches or []:
+            if m.get("queueId") != FLEX_QUEUE_ID:
+                continue
+
+            gc_ms = m.get("gameCreation") or 0
+            gc_ts = gc_ms / 1000.0
+            if not (week_start_ts <= gc_ts < week_end_ts):
+                continue
+
+            game_id = m.get("gameId")
+            if game_id is None:
+                continue
+
+            game_to_profiles.setdefault(game_id, set()).add(name)
+
+    # 2) For each player, collect DPM scores only from games where
+    #    ≥ MIN_GROUP_PLAYERS_IN_GAME tracked profiles share that gameId.
+    entries: list[dict] = []
+
+    for name in DPM_FLEX_PROFILES.keys():
+        matches = snap.get(name, []) or []
+        scores: list[float] = []
+
+        for m in matches:
+            if m.get("queueId") != FLEX_QUEUE_ID:
+                continue
+
+            gc_ms = m.get("gameCreation") or 0
+            gc_ts = gc_ms / 1000.0
+            if not (week_start_ts <= gc_ts < week_end_ts):
+                continue
+
+            game_id = m.get("gameId")
+            if game_id is None:
+                continue
+
+            profiles_in_game = game_to_profiles.get(game_id, set())
+            if len(profiles_in_game) < MIN_GROUP_PLAYERS_IN_GAME:
+                continue
+
+            # This match is a valid "group flex" game for this player.
+            # match-history gives this player's stats at participants[0].
+            part_list = m.get("participants") or []
+            if not part_list:
+                continue
+            dpm_score = part_list[0].get("dpmScore")
+
+            if isinstance(dpm_score, (int, float)):
+                scores.append(float(dpm_score))
+
+        if len(scores) >= MIN_FLEX_GAMES_PER_WEEK:
+            avg = sum(scores) / len(scores) if scores else 0.0
+            entries.append(
+                {
+                    "name": name,
+                    "games": len(scores),
+                    "avg": avg,
+                }
+            )
+
+    # 3) Sort best → worst
+    entries.sort(key=lambda e: e["avg"], reverse=True)
+
+    # 4) Attach deltas vs last week and save history
+    history = load_flex_leaderboard_history()
+    this_week_key = display_start.isoformat()  # e.g. "2025-12-01"
+
+    # Find latest prior week key < this_week_key
+    prev_key = None
+    for k in sorted(history.keys()):
+        if k < this_week_key:
+            prev_key = k
+    prev_entries = history.get(prev_key, []) if prev_key else []
+    prev_positions = {e["name"]: idx + 1 for idx, e in enumerate(prev_entries)}
+
+    for idx, e in enumerate(entries):
+        new_pos = idx + 1
+        old_pos = prev_positions.get(e["name"])
+        if old_pos is None:
+            e["delta"] = None
+        else:
+            e["delta"] = old_pos - new_pos  # positive = moved up
+
+    # Save this week's ranking for next comparison
+    history[this_week_key] = [
+        {"name": e["name"], "games": e["games"], "avg": e["avg"]} for e in entries
+    ]
+    save_flex_leaderboard_history(history)
+
+    return entries, display_start, display_end
+
+
+async def compute_recent_flex_leaderboard_from_local(hours: int = 18) -> tuple[list[dict], datetime, datetime]:
+    """
+    Compute a temporary Flex leaderboard over the last `hours` (default 18h).
+
+    A game counts for a player if:
+      - queueId == FLEX_QUEUE_ID (Flex)
+      - gameCreation is within [now - hours, now]
+      - that game's gameId appears for at least MIN_GROUP_PLAYERS_IN_GAME profiles
+        in DPM_FLEX_PROFILES (i.e., ≥4 of your tracked accounts played that game).
+
+    Unlike the weekly leaderboard:
+      - There is NO minimum games requirement (as long as player has ≥1 qualifying game).
+      - No history or delta is saved/used.
+    """
+    if not DPM_FLEX_PROFILES:
+        now_utc = datetime.now(timezone.utc)
+        start_utc = now_utc - timedelta(hours=hours)
+        return [], start_utc, now_utc
+
+    now_utc = datetime.now(timezone.utc)
+    start_utc = now_utc - timedelta(hours=hours)
+    start_ts = start_utc.timestamp()
+    end_ts = now_utc.timestamp()
+
+    snap = _snapshot_dpm_matches()  # { profile_name: [matches...] }
+
+    # 1) Build gameId -> set of tracked profile names who have that game in this window
+    game_to_profiles: dict[int, set[str]] = {}
+
+    for name, matches in snap.items():
+        if name not in DPM_FLEX_PROFILES:
+            continue
+
+        for m in matches or []:
+            if m.get("queueId") != FLEX_QUEUE_ID:
+                continue
+
+            gc_ms = m.get("gameCreation") or 0
+            gc_ts = gc_ms / 1000.0
+            if not (start_ts <= gc_ts <= end_ts):
+                continue
+
+            game_id = m.get("gameId")
+            if game_id is None:
+                continue
+
+            game_to_profiles.setdefault(game_id, set()).add(name)
+
+    # 2) Per-player scores from valid group games (≥4 tracked profiles per gameId)
+    entries: list[dict] = []
+
+    for name in DPM_FLEX_PROFILES.keys():
+        matches = snap.get(name, []) or []
+        scores: list[float] = []
+
+        for m in matches:
+            if m.get("queueId") != FLEX_QUEUE_ID:
+                continue
+
+            gc_ms = m.get("gameCreation") or 0
+            gc_ts = gc_ms / 1000.0
+            if not (start_ts <= gc_ts <= end_ts):
+                continue
+
+            game_id = m.get("gameId")
+            if game_id is None:
+                continue
+
+            profiles_in_game = game_to_profiles.get(game_id, set())
+            if len(profiles_in_game) < MIN_GROUP_PLAYERS_IN_GAME:
+                continue
+
+            part_list = m.get("participants") or []
+            if not part_list:
+                continue
+            dpm_score = part_list[0].get("dpmScore")
+
+            if isinstance(dpm_score, (int, float)):
+                scores.append(float(dpm_score))
+
+        # 🔥 NO minimum game requirement beyond at least 1 qualifying game
+        if not scores:
+            continue
+
+        avg = sum(scores) / len(scores)
+        entries.append(
+            {
+                "name": name,
+                "games": len(scores),
+                "avg": avg,
+            }
+        )
+
+    entries.sort(key=lambda e: e["avg"], reverse=True)
+    return entries, start_utc, now_utc
+
+def format_recent_flex_leaderboard(entries: list[dict], start_utc: datetime, end_utc: datetime) -> str:
+    MEDALS = ["🥇", "🥈", "🥉"]
+
+    # Convert to local time for display
+    start_local = start_utc.astimezone(LOCAL_TIMEZONE)
+    end_local = end_utc.astimezone(LOCAL_TIMEZONE)
+
+
+    header_end = end_local.strftime("%m-%d")
+
+    if not entries:
+        return (
+            f"**⏱️ LAST FLEX SESSION LEADERBOARD** ({header_end})\n"
+            "```text\n"
+            "No qualifying Flex games in the last 18 hours.\n"
+            f"- Still require ≥{MIN_GROUP_PLAYERS_IN_GAME}/5 tracked members in the same game\n"
+            "```"
+        )
+
+    # Precompute string columns
+    rank_col = [str(i) for i in range(1, len(entries) + 1)]
+    name_col = [e["name"] for e in entries]
+    score_col = [f"{e['avg']:.2f}" for e in entries]
+    games_col = [str(e["games"]) for e in entries]
+
+    # Column widths
+    rank_w = max(len("RK"), max(len(r) for r in rank_col))
+    name_w = max(len("Player"), max(len(n) for n in name_col))
+    score_w = max(len("Score"), max(len(s) for s in score_col))
+    games_w = max(len("Games"), max(len(g) for g in games_col))
+
+    lines: list[str] = []
+    lines.append(f"**⏱️ LAST FLEX SESSION LEADERBOARD** ( {header_end})")
+    lines.append("```text")
+
+    # Header
+    header = (
+        f"{'RK'.rjust(rank_w)}  "
+        f"{'Player'.ljust(name_w)}  "
+        f"{'Score'.rjust(score_w)}  "
+        f"{'Games'.rjust(games_w)}"
+    )
+    lines.append(header)
+    lines.append("-" * len(header))
+
+    # Rows (with medal swap for 1/2/3, same trick as your weekly)
+    for idx, (r, n, s, g) in enumerate(zip(rank_col, name_col, score_col, games_col), start=1):
+        # Replace ranks 1,2,3 with medal emoji (no padding)
+        if idx == 1:
+            rk_field = "🥇"
+        elif idx == 2:
+            rk_field = "🥈"
+        elif idx == 3:
+            rk_field = "🥉"
+        else:
+            rk_field = r.rjust(rank_w)
+
+        line = (
+            f"{rk_field}  "
+            f"{n.ljust(name_w)}  "
+            f"{s.rjust(score_w)}  "
+            f"{g.rjust(games_w)}"
+        )
+        lines.append(line)
+
+    lines.append("```")
+    return "\n".join(lines)
+
+
+
+def format_flex_leaderboard(entries: list[dict], display_start: datetime.date, display_end: datetime.date) -> str:
+    MEDALS = ["🥇", "🥈", "🥉"]
+
+    start_str = display_start.strftime("%m-%d")
+    end_str = display_end.strftime("%m-%d")
+
+
+    if not entries:
+        return (
+            f"**🏆 WEEKLY FLEX LEADERBOARD** ({start_str} → {end_str})\n"
+            "```text\n"
+            "No qualifying Flex games found for last week.\n"
+            f"- Need ≥{MIN_FLEX_GAMES_PER_WEEK} Flex games per player\n"
+            f"- Only counting games where ≥{MIN_GROUP_PLAYERS_IN_GAME}/5 tracked members played together\n"
+            "```"
+        )
+
+    lines: list[str] = []
+    start_str = display_start.strftime("%m-%d")
+    end_str = display_end.strftime("%m-%d")
+    lines.append(f"**🏆 WEEKLY FLEX LEADERBOARD** ({start_str} → {end_str})")
+
+
+    
+
+    # ----- Boxed table (ASCII only so alignment stays perfect) -----
+
+    # Precompute string versions for table columns
+    rank_col = [str(i) for i in range(1, len(entries) + 1)]
+    name_col = [e["name"] for e in entries]
+    score_col = [f"{e['avg']:.2f}" for e in entries]
+    games_col = [str(e["games"]) for e in entries]
+
+    change_col = []
+    for e in entries:
+        delta = e.get("delta")
+        if delta is None or delta == 0:
+            change_col.append("-")
+        elif delta > 0:
+            change_col.append(f"+{delta}")
+        else:
+            change_col.append(str(delta))
+
+    # Column widths
+    rank_w = max(len("RK"), max(len(r) for r in rank_col))
+    name_w = max(len("Player"), max(len(n) for n in name_col))
+    score_w = max(len("Score"), max(len(s) for s in score_col))
+    games_w = max(len("Games"), max(len(g) for g in games_col))
+    change_w = max(len("Change"), max(len(c) for c in change_col))
+
+    # Start code block
+    lines.append("```text")
+
+    # Header
+    header = (
+        f"{'RK'.rjust(rank_w)}  "
+        f"{'Player'.ljust(name_w)}  "
+        f"{'Score'.rjust(score_w)}  "
+        f"{'Games'.rjust(games_w)}  "
+        f"{'Change'.rjust(change_w)}"
+    )
+    lines.append(header)
+    lines.append("-" * len(header))
+
+    # Rows
+    for idx, (r, n, s, g, c) in enumerate(zip(rank_col, name_col, score_col, games_col, change_col), start=1):
+
+        # --- Replace ranks 1,2,3 with medal emoji (no padding!) ---
+        if idx == 1:
+            rk = "🥇"
+        elif idx == 2:
+            rk = "🥈"
+        elif idx == 3:
+            rk = "🥉"
+        else:
+            rk = r.rjust(rank_w)  # numeric ranks stay aligned
+
+        # For emoji rows → no rjust (prevents whitespace)
+        if idx <= 3:
+            rk_field = rk   # raw, no spacing at all
+        else:
+            rk_field = rk   # already right-justified for numeric
+
+        line = (
+            f"{rk_field}  "
+            f"{n.ljust(name_w)}  "
+            f"{s.rjust(score_w)}  "
+            f"{g.rjust(games_w)}  "
+            f"{c.rjust(change_w)}"
+        )
+        lines.append(line)
+
+
+    lines.append("```")
+
+    return "\n".join(lines)
+
+
+
+
+async def fetch_dpm_matches_for_player(
+    session: aiohttp.ClientSession,
+    name: str,
+    profile: dict,
+    week_start_ts: float,
+    tracked_puuids: set[str],
+    min_group_size: int,
+) -> list[float]:
+    """
+    Fetch weekly Flex games for a single profile and return the list of dpmScore values
+    for games that:
+      - are Flex queue
+      - were created after week_start_ts
+      - contain at least `min_group_size` tracked players
+    """
+    endpoint = profile["endpoint"]
+    puuid = profile["puuid"]
+
+    scores: list[float] = []
+
+    try:
+        async with session.get(endpoint) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                print(f"[FlexLB] {name}: HTTP {resp.status} from DPM: {text[:200]}")
+                return scores
+
+            data = await resp.json()
+
+    except Exception as e:
+        print(f"[FlexLB] {name}: error fetching DPM data: {e}")
+        return scores
+
+    matches = data.get("matches", []) or []
+    for m in matches:
+        # 1) Ensure Flex queue
+        if m.get("queueId") != FLEX_QUEUE_ID:
+            continue
+
+        # 2) Ensure within last week
+        game_creation_ms = m.get("gameCreation") or 0
+        game_ts = game_creation_ms / 1000.0  # DPM uses ms since epoch
+        if game_ts < week_start_ts:
+            continue
+
+        participants = m.get("participants", []) or []
+
+        # 3) How many tracked players were in this game?
+        present = 0
+        for p in participants:
+            p_puuid = p.get("puuid")
+            if p_puuid in tracked_puuids:
+                present += 1
+
+        if present < min_group_size:
+            # Not enough people from our group in this game
+            continue
+
+        # 4) Find this player's participant row
+        player_part = None
+        for p in participants:
+            if p.get("puuid") == puuid:
+                player_part = p
+                break
+
+        if not player_part:
+            continue
+
+        dpm_score = player_part.get("dpmScore")
+        if isinstance(dpm_score, (int, float)):
+            scores.append(float(dpm_score))
+
+    return scores
+
+
+async def compute_weekly_flex_leaderboard() -> tuple[list[dict], datetime, datetime]:
+    """
+    Compute the weekly Flex leaderboard.
+
+    Returns:
+        (entries, week_start_dt, now_dt)
+        where entries is a list of dicts:
+            { "name": str, "games": int, "avg": float }
+        sorted by avg descending.
+    """
+    if not DPM_FLEX_PROFILES:
+        return [], datetime.now(timezone.utc), datetime.now(timezone.utc)
+
+    now = datetime.now(timezone.utc)
+    week_start = now - timedelta(days=7)
+    week_start_ts = week_start.timestamp()
+
+    # All tracked PUUIDs (for 'how many people from the list are in this game')
+    tracked_puuids: set[str] = {p["puuid"] for p in DPM_FLEX_PROFILES.values()}
+
+    # "At least 4/5 of the people from the list are in the game"
+    # Generalized to ceil(0.8 * N) so it still works if you ever add/remove people.
+    import math as _math
+    min_group_size = max(1, _math.ceil(0.8 * len(tracked_puuids)))
+
+    entries: list[dict] = []
+
+    async with aiohttp.ClientSession() as session:
+        tasks_list = []
+        names = list(DPM_FLEX_PROFILES.keys())
+
+        for name in names:
+            profile = DPM_FLEX_PROFILES[name]
+            tasks_list.append(
+                fetch_dpm_matches_for_player(
+                    session,
+                    name,
+                    profile,
+                    week_start_ts,
+                    tracked_puuids,
+                    min_group_size,
+                )
+            )
+
+        results = await asyncio.gather(*tasks_list, return_exceptions=True)
+
+    for name, scores_or_exc in zip(DPM_FLEX_PROFILES.keys(), results):
+        if isinstance(scores_or_exc, Exception):
+            print(f"[FlexLB] {name}: exception {scores_or_exc}")
+            continue
+
+        scores: list[float] = scores_or_exc
+
+        # Only consider players with at least MIN_FLEX_GAMES_PER_WEEK eligible games
+        if len(scores) < MIN_FLEX_GAMES_PER_WEEK:
+            continue
+
+        avg = sum(scores) / len(scores)
+        entries.append({"name": name, "games": len(scores), "avg": avg})
+
+    # Sort highest to lowest
+    entries.sort(key=lambda e: e["avg"], reverse=True)
+
+    return entries, week_start, now
+
+
+
+
+
+
+
+async def fetch_schmort_match_basic(n: int = 1) -> tuple[str, dict, str]:
+    """
+    Fetch Schmort#bone's (NA) n-th most recent match.
+    Returns (match_id, match_data, puuid).
+
+    This is independent of get_match_for_schmort and does NOT fetch timeline.
+    """
+    api_key = os.getenv("RIOT_API_KEY")
+    if not api_key:
+        raise RuntimeError("RIOT_API_KEY is not set in the environment.")
+
+    if n < 1:
+        n = 1
+
+    async with aiohttp.ClientSession() as session:
+        # 1) Account info
+        account_url = (
+            f"https://{RIOT_ROUTING_REGION}.api.riotgames.com/riot/account/v1/"
+            f"accounts/by-riot-id/{quote(RIOT_GAME_NAME)}/{quote(RIOT_TAGLINE)}"
+        )
+        account_data = await _riot_get_json(session, account_url, api_key)
+        puuid = account_data["puuid"]
+
+        # 2) Match list
+        count = max(n, 1)
+        matches_url = (
+            f"https://{RIOT_ROUTING_REGION}.api.riotgames.com/lol/match/v5/"
+            f"matches/by-puuid/{puuid}/ids?start=0&count={count}"
+        )
+        match_ids = await _riot_get_json(session, matches_url, api_key)
+        if len(match_ids) < n:
+            raise RuntimeError(f"Player only has {len(match_ids)} matches available.")
+        match_id = match_ids[n - 1]
+
+        # 3) Match data
+        match_url = (
+            f"https://{RIOT_ROUTING_REGION}.api.riotgames.com/lol/match/v5/matches/{match_id}"
+        )
+        match_data = await _riot_get_json(session, match_url, api_key)
+
+    return match_id, match_data, puuid
+
+# ---------- DPM-style scoring (independent of old scoring) ----------
+
+# Per-role KDA weights (approx from your DPM exports)
+DPM_KDA_WEIGHTS = {
+    "TOP":     {"kills": 0.80, "deaths": -1.50, "assists": 0.80},
+    "JUNGLE":  {"kills": 0.75, "deaths": -1.50, "assists": 0.75},
+    "MIDDLE":  {"kills": 0.75, "deaths": -1.50, "assists": 0.75},
+    "BOTTOM":  {"kills": 0.75, "deaths": -1.50, "assists": 0.75},
+    "UTILITY": {"kills": 0.85, "deaths": -1.25, "assists": 0.90},
+}
+
+# Vision score / min → contribution, by role
+DPM_VSPM_WEIGHTS = {
+    "TOP":     {"a": 7.10, "b": -3.55},
+    "JUNGLE":  {"a": 5.64, "b": -3.69},
+    "MIDDLE":  {"a": 7.00, "b": -3.85},
+    "BOTTOM":  {"a": 7.00, "b": -3.85},
+    "UTILITY": {"a": 5.20, "b": -7.54},
+}
+
+def _dpm_get_role(player: dict) -> str:
+    raw = (
+        player.get("teamPosition")
+        or player.get("individualPosition")
+        or player.get("lane")
+        or ""
+    ).upper()
+    if raw in ("TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY"):
+        return raw
+    # If Riot gives us weird stuff (e.g. "NONE"), treat as ADC-ish
+    return "BOTTOM"
+
+
+def _dpm_global(player: dict, game_minutes: float) -> tuple[float, dict]:
+    """Global section: KDA, CS/min, gold/min, damage/min, vision/min, first blood."""
+    role = _dpm_get_role(player)
+    ch = player.get("challenges", {}) or {}
+
+    w_kda = DPM_KDA_WEIGHTS.get(role, DPM_KDA_WEIGHTS["BOTTOM"])
+    w_vspm = DPM_VSPM_WEIGHTS.get(role, DPM_VSPM_WEIGHTS["BOTTOM"])
+
+    kills = player.get("kills", 0)
+    deaths = player.get("deaths", 0)
+    assists = player.get("assists", 0)
+
+    total_cs = player.get("totalMinionsKilled", 0) + player.get("neutralMinionsKilled", 0)
+    cs_pm = total_cs / game_minutes if game_minutes > 0 else 0.0
+
+    gold = player.get("goldEarned", 0)
+    gpm = ch.get("goldPerMinute")
+    if gpm is None:
+        gpm = gold / game_minutes if game_minutes > 0 else 0.0
+
+    dmg = player.get("totalDamageDealtToChampions", 0)
+    dpm = ch.get("damagePerMinute")
+    if dpm is None:
+        dpm = dmg / game_minutes if game_minutes > 0 else 0.0
+
+    vision = player.get("visionScore", 0)
+    vspm = ch.get("visionScorePerMinute")
+    if vspm is None:
+        vspm = vision / game_minutes if game_minutes > 0 else 0.0
+
+    got_fb = bool(player.get("firstBloodKill") or player.get("firstBloodAssist"))
+
+    # KDA contributions
+    kills_c = w_kda["kills"] * kills
+    deaths_c = w_kda["deaths"] * deaths
+    assists_c = w_kda["assists"] * assists
+
+    # Per-minute stat contributions (same across roles except vspm)
+    cs_c = 0.65 * cs_pm - 2.4      # approximate from exports
+    gpm_c = 0.03 * gpm - 8.5
+    dpm_c = 0.0067 * dpm + 0.07
+    vspm_c = w_vspm["a"] * vspm + w_vspm["b"]
+
+    fb_c = 5.0 if got_fb else 0.0
+
+    total = kills_c + deaths_c + assists_c + cs_c + gpm_c + dpm_c + vspm_c + fb_c
+    details = {
+        "kills": kills_c,
+        "deaths": deaths_c,
+        "assists": assists_c,
+        "csm": cs_c,
+        "goldPerMinute": gpm_c,
+        "damagePerMinute": dpm_c,
+        "visionScorePerMinute": vspm_c,
+        "firstBlood": fb_c,
+    }
+    return total, details
+
+
+def _dpm_objectives(player: dict, team_participants: list[dict]) -> tuple[float, dict]:
+    """Objectives section: dragons, heralds, barons, horde, objective damage, steals."""
+    ch = player.get("challenges", {}) or {}
+
+    dragons = ch.get("dragonTakedowns", 0.0)
+    heralds = ch.get("riftHeraldTakedowns", 0.0)
+    barons = ch.get("baronTakedowns", 0.0)
+    # DPM uses "horde" (void grubs / atakhan); approximate via any void epic stat if present
+    horde = ch.get("voidMonsterKills", 0.0)
+    steals = ch.get("epicMonsterSteals", 0.0)
+
+    obj_damage = player.get("damageDealtToObjectives", 0.0) or 0.0
+
+    # Coefficients approximated from DPM exports
+    dragon_c = 2.0 * dragons
+    baron_c = 2.0 * barons
+    herald_c = 3.0 * heralds
+    horde_c = 0.5 * horde
+    dmg_c = 6.15e-05 * obj_damage
+    steals_c = 3.5 * steals
+
+    total = dragon_c + baron_c + herald_c + horde_c + dmg_c + steals_c
+    details = {
+        "dragon": dragon_c,
+        "baron": baron_c,
+        "riftHerald": herald_c,
+        "horde": horde_c,
+        "damageDealtToObjectives": dmg_c,
+        "epicMonsterSteals": steals_c,
+    }
+    return total, details
+
+
+def _dpm_team(player: dict, team_participants: list[dict]) -> tuple[float, dict]:
+    """
+    Team section: kill participation, damage share, damage taken share.
+    Using KP%, teamDamage% and damageTaken% from challenges (0..1) mapped via linear fits.
+    """
+    ch = player.get("challenges", {}) or {}
+
+    kp_frac = ch.get("killParticipation")
+    team_dmg_frac = ch.get("teamDamagePercentage")
+    taken_frac = ch.get("damageTakenOnTeamPercentage")
+
+    # Fallbacks if challenges missing (just in case)
+    team_kills = sum(tp.get("kills", 0) for tp in team_participants) or 1
+    if kp_frac is None:
+        kp_frac = float(player.get("kills", 0) + player.get("assists", 0)) / team_kills
+
+    if team_dmg_frac is None:
+        team_total_dmg = sum(tp.get("totalDamageDealtToChampions", 0) for tp in team_participants) or 1
+        team_dmg_frac = float(player.get("totalDamageDealtToChampions", 0)) / team_total_dmg
+
+    if taken_frac is None:
+        team_total_taken = sum(tp.get("totalDamageTaken", 0) for tp in team_participants) or 1
+        taken_frac = float(player.get("totalDamageTaken", 0)) / team_total_taken
+
+    # Convert to % to match the scale we fitted on
+    kp_pct = kp_frac * 100.0
+    dmg_pct = team_dmg_frac * 100.0
+    taken_pct = taken_frac * 100.0
+
+    kp_c = 0.1280 * kp_pct - 3.221
+    taken_c = 0.0693 * taken_pct - 0.434
+    dmg_c = 0.0898 * dmg_pct - 0.317
+
+    total = kp_c + dmg_c + taken_c
+    details = {
+        "killParticipation": kp_c,
+        "teamDamagePercentage": dmg_c,
+        "damageTakenOnTeamPercentage": taken_c,
+    }
+    return total, details
+
+
+def _dpm_role_section(player: dict) -> tuple[float, dict]:
+    """
+    Role-specific micro section: uses challenges fields.
+    This does NOT touch your old lane scoring.
+    """
+    role = _dpm_get_role(player)
+    ch = player.get("challenges", {}) or {}
+
+    details = {}
+    total = 0.0
+
+    if role in ("TOP", "MIDDLE", "BOTTOM"):
+        lm10 = ch.get("laneMinionsFirst10Minutes", 0.0)
+        solo = ch.get("soloKills", player.get("soloKills", 0.0))
+        plates = ch.get("turretPlatesTaken", 0.0)
+        turrets = player.get("turretTakedowns", 0.0)
+        first_tower = 5.0 if (player.get("firstTowerKill") or player.get("firstTowerAssist")) else 0.0
+
+        if role == "TOP":
+            lm_a, lm_b = 0.35, -18.9
+            solo_w = 0.75
+            turret_w = 0.85
+        elif role == "MIDDLE":
+            lm_a, lm_b = 0.35, -18.55
+            solo_w = 0.85
+            turret_w = 0.75
+        else:  # BOTTOM
+            lm_a, lm_b = 0.37, -18.87
+            solo_w = 1.50
+            turret_w = 0.75
+
+        lm_c = lm_a * lm10 + lm_b
+        solo_c = solo_w * solo
+        plates_c = 0.75 * plates
+        turrets_c = turret_w * turrets
+
+        total = lm_c + solo_c + plates_c + turrets_c + first_tower
+        details = {
+            "laneMinionsFirst10Minutes": lm_c,
+            "soloKills": solo_c,
+            "turretPlatesTaken": plates_c,
+            "turretTakedowns": turrets_c,
+            "firstTurretKilled": first_tower,
+        }
+
+    elif role == "JUNGLE":
+        init_crabs = ch.get("initialCrabCount", 0.0)
+        scuttles = ch.get("scuttleCrabKills", 0.0)
+        jg_cs10 = ch.get("jungleCsBefore10Minutes", 0.0)
+        enemy_jg = ch.get("enemyJungleMonsterKills", 0.0)
+        buffs = ch.get("buffsStolen", 0.0)
+        picks = ch.get("pickKillWithAlly", 0.0)
+
+        init_c = 1.5 * init_crabs
+        scuttle_c = 1.0 * scuttles
+        jg_cs_c = 0.10 * jg_cs10
+        enemy_jg_c = 1.0 * enemy_jg
+        buffs_c = 1.5 * buffs
+        picks_c = 1.0 * picks
+
+        total = init_c + scuttle_c + jg_cs_c + enemy_jg_c + buffs_c + picks_c
+        details = {
+            "initialCrabCount": init_c,
+            "scuttleCrabKills": scuttle_c,
+            "jungleCsBefore10Minutes": jg_cs_c,
+            "enemyJungleMonsterKills": enemy_jg_c,
+            "buffsStolen": buffs_c,
+            "pickKillWithAlly": picks_c,
+        }
+
+    elif role == "UTILITY":
+        cw_time = ch.get("controlWardTimeCoverageInRiverOrEnemyHalf", 0.0) or 0.0
+        cw_placed = ch.get("controlWardsPlaced", 0.0)
+        ward_takedowns = ch.get("wardTakedowns", 0.0)
+        stealth = ch.get("stealthWardsPlaced", 0.0)
+        picks = ch.get("pickKillWithAlly", 0.0)
+        saves = ch.get("saveAllyFromDeath", 0.0)
+
+        cw_time_c = 4.0 * cw_time
+        cw_placed_c = 1.0 * cw_placed
+        ward_takedowns_c = 1.0 * ward_takedowns
+        stealth_c = 0.5 * stealth
+        picks_c = 1.0 * picks
+        saves_c = 1.0 * saves
+
+        total = cw_time_c + cw_placed_c + ward_takedowns_c + stealth_c + picks_c + saves_c
+        details = {
+            "controlWardTimeCoverageInRiverOrEnemyHalf": cw_time_c,
+            "controlWardsPlaced": cw_placed_c,
+            "wardTakedowns": ward_takedowns_c,
+            "stealthWardsPlaced": stealth_c,
+            "pickKillWithAlly": picks_c,
+            "saveAllyFromDeath": saves_c,
+        }
+
+    return total, details
+
+
+def compute_dpm_score(match_data: dict, puuid: str) -> tuple[float, dict, dict]:
+    """
+    Compute a DPM-style score for the given player in a match.
+
+    Returns:
+        (final_score_0_100, breakdown_dict, player_participant_dict)
+    """
+    info = match_data.get("info", {})
+    participants = info.get("participants", [])
+
+    player = None
+    for p in participants:
+        if p.get("puuid") == puuid:
+            player = p
+            break
+    if player is None:
+        raise RuntimeError("Player puuid not found in match participants.")
+
+    team_id = player.get("teamId")
+    team_participants = [p for p in participants if p.get("teamId") == team_id]
+
+    # Use timePlayed if present; otherwise fall back to gameDuration
+    time_played = player.get("timePlayed") or info.get("gameDuration", 1)
+    game_minutes = max(time_played / 60.0, 1e-3)
+
+    global_score, global_details = _dpm_global(player, game_minutes)
+    obj_score, obj_details = _dpm_objectives(player, team_participants)
+    team_score, team_details = _dpm_team(player, team_participants)
+    role_score, role_details = _dpm_role_section(player)
+
+    win = bool(player.get("win"))
+    game_state_score = 3.0 if win else -3.0
+
+    raw_total = 15.0 + global_score + obj_score + team_score + game_state_score + role_score
+    final_score = max(0.0, min(100.0, raw_total))
+
+    breakdown = {
+        "win": win,
+        "role": _dpm_get_role(player),
+        "global": {"score": global_score, "details": global_details},
+        "objectives": {"score": obj_score, "details": obj_details},
+        "team": {"score": team_score, "details": team_details},
+        "gameState": {"score": game_state_score, "details": {"win": game_state_score}},
+        "roleSection": {"score": role_score, "details": role_details},
+        "raw_total_before_clamp": raw_total,
+    }
+    return final_score, breakdown, player
+
+
+# ---------- DPM-like score (recreating DPM site structure) ----------
+
+# Per-role KDA weights (reverse-engineered from DPM exports)
+DPM_GLOBAL_KDA = {
+    "TOP":     {"kills": 0.80, "deaths": -1.50, "assists": 0.80},
+    "JUNGLE":  {"kills": 0.75, "deaths": -1.50, "assists": 0.75},
+    "MIDDLE":  {"kills": 0.75, "deaths": -1.50, "assists": 0.75},
+    "BOTTOM":  {"kills": 0.75, "deaths": -1.50, "assists": 0.75},
+    "UTILITY": {"kills": 0.85, "deaths": -1.25, "assists": 0.90},
+}
+
+# Approx VSPM → global contribution by role: a * vspm + b
+DPM_GLOBAL_VSPM = {
+    "TOP":     {"a": 7.10, "b": -3.55},
+    "JUNGLE":  {"a": 5.64, "b": -3.69},
+    "MIDDLE":  {"a": 7.00, "b": -3.85},
+    "BOTTOM":  {"a": 7.00, "b": -3.85},
+    "UTILITY": {"a": 5.20, "b": -7.54},
+}
+
+# CS/min contribution per role: a * cs_pm + b (approximate)
+DPM_GLOBAL_CSPM = {
+    "TOP":     {"a": 2.20, "b": -12.0},
+    "JUNGLE":  {"a": 1.55, "b": -9.0},
+    "MIDDLE":  {"a": 1.80, "b": -10.5},
+    "BOTTOM":  {"a": 1.80, "b": -10.5},
+    "UTILITY": {"a": 0.0,  "b": 0.0},
+}
+
+# Gold/min contribution: a * gpm + b (approximate)
+DPM_GLOBAL_GPM = {
+    "TOP":     {"a": 0.035, "b": -12.0},
+    "JUNGLE":  {"a": 0.035, "b": -12.0},
+    "MIDDLE":  {"a": 0.040, "b": -14.0},
+    "BOTTOM":  {"a": 0.040, "b": -14.0},
+    "UTILITY": {"a": 0.060, "b": -16.2},
+}
+
+# Damage/min contribution: a * dpm (+ small intercept)
+DPM_GLOBAL_DPM = {
+    "TOP":     {"a": 0.0070,  "b": 0.0},
+    "JUNGLE":  {"a": 0.0060,  "b": 0.0},
+    "MIDDLE":  {"a": 0.0073,  "b": 0.0},
+    "BOTTOM":  {"a": 0.0067,  "b": 0.0},
+    "UTILITY": {"a": 0.0045,  "b": 0.0},
+}
+
+
+def _get_role(player: dict) -> str:
+    raw = (player.get("teamPosition") or player.get("role") or "").upper()
+    if raw in ("TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY"):
+        return raw
+    # fallback: treat unknown as ADC-ish
+    return "BOTTOM"
+
+
+def _dpm_global_section(player: dict, game_minutes: float) -> tuple[float, dict]:
+    """Approximate DPM 'global' section from Riot stats."""
+    role = _get_role(player)
+    kcfg = DPM_GLOBAL_KDA.get(role, DPM_GLOBAL_KDA["BOTTOM"])
+    vcfg = DPM_GLOBAL_VSPM.get(role, DPM_GLOBAL_VSPM["BOTTOM"])
+    ccfg = DPM_GLOBAL_CSPM.get(role, DPM_GLOBAL_CSPM["BOTTOM"])
+    gcfg = DPM_GLOBAL_GPM.get(role, DPM_GLOBAL_GPM["BOTTOM"])
+    dcfg = DPM_GLOBAL_DPM.get(role, DPM_GLOBAL_DPM["BOTTOM"])
+
+    ch = player.get("challenges", {}) or {}
+
+    kills = player.get("kills", 0)
+    deaths = player.get("deaths", 0)
+    assists = player.get("assists", 0)
+
+    cs = player.get("totalMinionsKilled", 0) + player.get("neutralMinionsKilled", 0)
+    cs_pm = cs / game_minutes if game_minutes > 0 else 0.0
+
+    gold = player.get("goldEarned", 0)
+    gpm = ch.get("goldPerMinute")
+    if gpm is None:
+        gpm = gold / game_minutes if game_minutes > 0 else 0.0
+
+    damage = player.get("totalDamageDealtToChampions", 0)
+    dpm = ch.get("damagePerMinute")
+    if dpm is None:
+        dpm = damage / game_minutes if game_minutes > 0 else 0.0
+
+    vision = player.get("visionScore", 0)
+    vspm = ch.get("visionScorePerMinute")
+    if vspm is None:
+        vspm = vision / game_minutes if game_minutes > 0 else 0.0
+
+    # First blood: +5 if you got FB (kill or assist)
+    first_blood = 0.0
+    if player.get("firstBloodKill") or player.get("firstBloodAssist"):
+        first_blood = 5.0
+
+    kills_contrib = kcfg["kills"] * kills
+    deaths_contrib = kcfg["deaths"] * deaths
+    assists_contrib = kcfg["assists"] * assists
+
+    cs_contrib = ccfg["a"] * cs_pm + ccfg["b"]
+    gpm_contrib = gcfg["a"] * gpm + gcfg["b"]
+    dpm_contrib = dcfg["a"] * dpm + dcfg["b"]
+    vspm_contrib = vcfg["a"] * vspm + vcfg["b"]
+
+    total = (
+        kills_contrib
+        + deaths_contrib
+        + assists_contrib
+        + cs_contrib
+        + gpm_contrib
+        + dpm_contrib
+        + vspm_contrib
+        + first_blood
+    )
+
+    details = {
+        "kills": kills_contrib,
+        "deaths": deaths_contrib,
+        "assists": assists_contrib,
+        "csm": cs_contrib,
+        "goldPerMinute": gpm_contrib,
+        "damagePerMinute": dpm_contrib,
+        "visionScorePerMinute": vspm_contrib,
+        "firstBlood": first_blood,
+    }
+    return total, details
+
+
+
+
+
+def _dpm_objectives_section(player: dict, team_participants: list[dict]) -> tuple[float, dict]:
+    ch = player.get("challenges", {}) or {}
+    dragon = ch.get("dragonTakedowns", 0.0)
+    herald = ch.get("riftHeraldTakedowns", 0.0)
+    baron = ch.get("baronTakedowns", 0.0)
+    # "horde" on DPM is void grubs; approximate with any "void" epic count if present
+    horde = ch.get("voidMonsterKills", 0.0)
+
+    obj_damage = player.get("damageDealtToObjectives", 0.0)
+    team_obj_total = sum(tp.get("damageDealtToObjectives", 0) for tp in team_participants) or 1.0
+    obj_damage_share = obj_damage / team_obj_total
+
+    # Approximate similar scale to DPM exports
+    dragon_c = 1.5 * dragon
+    herald_c = 1.5 * herald
+    baron_c = 2.5 * baron
+    horde_c = 2.0 * horde
+    dmg_c = 3.0 * obj_damage_share
+
+    total = dragon_c + herald_c + baron_c + horde_c + dmg_c
+    details = {
+        "dragon": dragon_c,
+        "baron": baron_c,
+        "riftHerald": herald_c,
+        "horde": horde_c,
+        "damageDealtToObjectives": dmg_c,
+        "epicMonsterSteals": 0.0,  # left 0 for now; easy to hook in later
+    }
+    return total, details
+
+
+def _dpm_team_section(player: dict, team_participants: list[dict]) -> tuple[float, dict]:
+    role = _get_role(player)
+    ch = player.get("challenges", {}) or {}
+
+    # Riot's challenges store these directly for most queues
+    kp_frac = ch.get("killParticipation")
+    if kp_frac is None:
+        team_kills = sum(tp.get("kills", 0) for tp in team_participants) or 1
+        kp_frac = float(player.get("kills", 0) + player.get("assists", 0)) / team_kills
+
+    team_dmg_frac = ch.get("teamDamagePercentage")
+    if team_dmg_frac is None:
+        team_total_damage = sum(tp.get("totalDamageDealtToChampions", 0) for tp in team_participants) or 1
+        team_dmg_frac = float(player.get("totalDamageDealtToChampions", 0)) / team_total_damage
+
+    taken_frac = ch.get("damageTakenOnTeamPercentage")
+    if taken_frac is None:
+        team_total_taken = sum(tp.get("totalDamageTaken", 0) for tp in team_participants) or 1
+        taken_frac = float(player.get("totalDamageTaken", 0)) / team_total_taken
+
+    expected_dmg_share = ROLE_EXPECTED_DAMAGE_SHARE.get(role, 0.22)
+
+    # Scale into DPM-like ranges (~ -2..+6-ish each)
+    kp_pct = kp_frac * 100.0
+    kp_c = (kp_pct - 55.0) / 10.0  # ~0 when ~55% KP
+
+    dmg_delta = (team_dmg_frac - expected_dmg_share) / max(expected_dmg_share, 1e-6)
+    dmg_c = 3.0 * dmg_delta
+
+    # For tanks / supports, taking more damage is ok; for carries it's slightly punished
+    base_taken_share = 1.0 / len(team_participants)
+    taken_delta = (taken_frac - base_taken_share) / max(base_taken_share, 1e-6)
+    if role in ("UTILITY", "TOP", "JUNGLE"):
+        taken_c = 2.0 * taken_delta
+    else:
+        taken_c = -1.5 * taken_delta
+
+    total = kp_c + dmg_c + taken_c
+    details = {
+        "killParticipation": kp_c,
+        "teamDamagePercentage": dmg_c,
+        "damageTakenOnTeamPercentage": taken_c,
+    }
+    return total, details
+
+
+def _dpm_role_micro_section(player: dict) -> tuple[float, dict]:
+    """
+    Micro / role-specific section: 'bottom', 'middle', 'top', 'jungle', 'utility'
+    built from Riot challenges. Approximates DPM's role sections.
+    """
+    role = _get_role(player)
+    ch = player.get("challenges", {}) or {}
+    details: dict[str, float] = {}
+    total = 0.0
+
+    if role in ("TOP", "MIDDLE", "BOTTOM"):
+        # Lane roles
+        lm10 = ch.get("laneMinionsFirst10Minutes", 0.0)
+        solo_kills = ch.get("soloKills", 0.0)
+        plates = ch.get("turretPlatesTaken", 0.0)
+        turret_takedowns = player.get("turretTakedowns", 0.0)
+        first_tower = 5.0 if player.get("firstTowerKill") or player.get("firstTowerAssist") else 0.0
+
+        if role == "TOP":
+            lm_a, lm_b = 0.35, -18.9
+            solo_coeff = 0.75
+            turret_coeff = 0.85
+        elif role == "MIDDLE":
+            lm_a, lm_b = 0.35, -18.55
+            solo_coeff = 0.85
+            turret_coeff = 0.75
+        else:  # BOTTOM (ADC)
+            lm_a, lm_b = 0.37, -18.87
+            solo_coeff = 1.50
+            turret_coeff = 0.75
+
+        lm_c = lm_a * lm10 + lm_b
+        solo_c = solo_coeff * solo_kills
+        plates_c = 0.75 * plates
+        turret_c = turret_coeff * turret_takedowns
+
+        total = lm_c + solo_c + plates_c + turret_c + first_tower
+        details = {
+            "laneMinionsFirst10Minutes": lm_c,
+            "soloKills": solo_c,
+            "turretPlatesTaken": plates_c,
+            "turretTakedowns": turret_c,
+            "firstTurretKilled": first_tower,
+        }
+
+    elif role == "JUNGLE":
+        init_crabs = ch.get("initialCrabCount", 0.0)
+        scuttles = ch.get("scuttleCrabKills", 0.0)
+        jng_cs10 = ch.get("jungleCsBefore10Minutes", 0.0)
+        enemy_jg = ch.get("enemyJungleMonsterKills", 0.0)
+        buffs_stolen = ch.get("buffsStolen", 0.0)
+        pick_kill = ch.get("pickKillWithAlly", 0.0)
+
+        # Close to DPM exports where the jungle details nearly summed to the jungle score
+        init_c = 1.5 * init_crabs
+        scuttle_c = 1.0 * scuttles
+        jng_cs_c = 0.1 * jng_cs10
+        enemy_jg_c = 1.0 * enemy_jg
+        buffs_c = 1.5 * buffs_stolen
+        pick_c = 1.0 * pick_kill
+
+        total = init_c + scuttle_c + jng_cs_c + enemy_jg_c + buffs_c + pick_c
+        details = {
+            "initialCrabCount": init_c,
+            "scuttleCrabKills": scuttle_c,
+            "jungleCsBefore10Minutes": jng_cs_c,
+            "enemyJungleMonsterKills": enemy_jg_c,
+            "buffsStolen": buffs_c,
+            "pickKillWithAlly": pick_c,
+        }
+
+    elif role == "UTILITY":
+        cw_time = ch.get("controlWardTimeCoverageInRiverOrEnemyHalf", 0.0) or 0.0
+        cw_placed = ch.get("controlWardsPlaced", 0.0)
+        ward_takedowns = ch.get("wardTakedowns", 0.0)
+        stealth_wards = ch.get("stealthWardsPlaced", 0.0)
+        pick_kill = ch.get("pickKillWithAlly", 0.0)
+        save_ally = ch.get("saveAllyFromDeath", 0.0)
+        # completeSupportQuestInTime often encoded as +/-3 on DPM; we skip it for now.
+
+        cw_time_c = 4.0 * cw_time
+        cw_placed_c = 1.0 * cw_placed
+        ward_takedowns_c = 1.0 * ward_takedowns
+        stealth_c = 0.5 * stealth_wards
+        pick_c = 1.0 * pick_kill
+        save_c = 1.0 * save_ally
+
+        total = cw_time_c + cw_placed_c + ward_takedowns_c + stealth_c + pick_c + save_c
+        details = {
+            "controlWardTimeCoverageInRiverOrEnemyHalf": cw_time_c,
+            "controlWardsPlaced": cw_placed_c,
+            "wardTakedowns": ward_takedowns_c,
+            "stealthWardsPlaced": stealth_c,
+            "pickKillWithAlly": pick_c,
+            "saveAllyFromDeath": save_c,
+        }
+
+    return total, details
+
 
 
 
@@ -1009,6 +2443,9 @@ class GeneralCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
+        # Start the weekly Flex leaderboard task (auto-post)
+        self.flex_weekly_leaderboard_task.start()
+
     @app_commands.command(name="ask", description="Ask the bot a question (optional: '(2hrs) question...' for context)")
     async def ask(self, interaction: Interaction, question: str):
         # HARD IGNORE: if user is ignored, completely ignore (no response)
@@ -1083,6 +2520,9 @@ class GeneralCog(commands.Cog):
             return
         await clear_disabled()
         await interaction.response.send_message("✅ On_message processing re-enabled.", ephemeral=True)
+        
+
+    
 
 
 
@@ -1340,6 +2780,162 @@ class GeneralCog(commands.Cog):
                 f"❌ Failed to send DM: {e}",
                 ephemeral=True
             )
+
+    @app_commands.command(
+        name="match",
+        description="Show Schmort's DPM-style score for his Nth most recent match."
+    )
+    @app_commands.describe(
+        index="Which game? 1 = most recent (default)"
+    )
+    async def match(
+        self,
+        interaction: Interaction,
+        index: int = 1
+    ):
+        """
+        /match N  → compute DPM-style score for Schmort#bone's Nth last match.
+        """
+        await interaction.response.defer()
+
+        try:
+            match_id, match_data, puuid = await fetch_schmort_match_basic(index)
+            dpm_score, breakdown, player = compute_dpm_score(match_data, puuid)
+        except Exception as e:
+            await interaction.followup.send(
+                f"❌ Error while fetching or scoring the match: `{e}`"
+            )
+            return
+
+        info = match_data.get("info", {})
+        queue_id = info.get("queueId")
+        queue_name = QUEUE_ID_TO_NAME.get(queue_id, f"Queue {queue_id}")
+        game_duration_sec = info.get("gameDuration", 0)
+        game_duration_min = game_duration_sec / 60.0 if game_duration_sec else 0.0
+
+        champ_name = player.get("championName", "Unknown")
+        role = breakdown.get("role", "UNKNOWN")
+        win = breakdown.get("win", False)
+
+        kills = player.get("kills", 0)
+        deaths = player.get("deaths", 0)
+        assists = player.get("assists", 0)
+
+        color = discord.Color.gold() if win else discord.Color.red()
+        result_text = "Victory" if win else "Defeat"
+
+        embed = discord.Embed(
+            title=f"DPM score for Schmort ({champ_name})",
+            description=(
+                f"Match: `{match_id}`\n"
+                f"Result: **{result_text}**\n"
+                f"Queue: **{queue_name}** (ID {queue_id})\n"
+                f"Length: **{game_duration_min:.1f} min**\n\n"
+                f"**DPM Score:** **{dpm_score:.2f}** / 100\n"
+                f"(raw sum before clamp: {breakdown['raw_total_before_clamp']:.2f})"
+            ),
+            color=color,
+        )
+
+        # Basic KDA + role
+        embed.add_field(
+            name="KDA / Role",
+            value=(
+                f"Champion: **{champ_name}**\n"
+                f"Role: **{role}**\n"
+                f"K/D/A: **{kills}/{deaths}/{assists}**"
+            ),
+            inline=True,
+        )
+
+        g = breakdown["global"]
+        t = breakdown["team"]
+        rs = breakdown["roleSection"]
+        obj = breakdown["objectives"]
+
+        embed.add_field(
+            name="Global section",
+            value=(
+                f"Score: **{g['score']:.2f}**\n"
+                f"Kills term: {g['details']['kills']:.2f}\n"
+                f"Deaths term: {g['details']['deaths']:.2f}\n"
+                f"Assists term: {g['details']['assists']:.2f}\n"
+                f"CS/min term: {g['details']['csm']:.2f}\n"
+                f"GPM term: {g['details']['goldPerMinute']:.2f}\n"
+                f"DPM term: {g['details']['damagePerMinute']:.2f}\n"
+                f"Vision/min term: {g['details']['visionScorePerMinute']:.2f}\n"
+                f"First blood: {g['details']['firstBlood']:.2f}"
+            ),
+            inline=False,
+        )
+
+        embed.add_field(
+            name="Objectives / Team / Role",
+            value=(
+                f"Objectives score: **{obj['score']:.2f}**\n"
+                f"Team score: **{t['score']:.2f}**\n"
+                f"Role score: **{rs['score']:.2f}**\n"
+                f"Game state: **{breakdown['gameState']['score']:.2f}**"
+            ),
+            inline=False,
+        )
+
+        await interaction.followup.send(embed=embed)
+
+
+    @app_commands.command(
+        name="weekly_flex_leaderboard",
+        description="Show this week's Flex leaderboard for the group."
+    )
+    async def flex_leaderboard(self, interaction: Interaction):
+        # You can add permission checks here if you want
+        await interaction.response.defer(thinking=True)
+
+        entries, week_start, now = await compute_weekly_flex_leaderboard_from_local()
+        msg = format_flex_leaderboard(entries, week_start, now)
+
+        # Manual mode: post to the channel where the slash command was used
+        await interaction.followup.send(msg)
+
+        # Runs every day at local midnight; only posts on Monday 00:00 local
+    # which is effectively "Sunday night at midnight".
+    @tasks.loop(time=dtime(hour=0, minute=0, tzinfo=LOCAL_TIMEZONE))
+    async def flex_weekly_leaderboard_task(self):
+        await self.bot.wait_until_ready()
+
+        now_local = datetime.now(LOCAL_TIMEZONE)
+        # Monday is 0; we only post at Monday 00:00
+        if now_local.weekday() != 0:
+            return
+
+        entries, week_start, now = await compute_weekly_flex_leaderboard_from_local()
+        msg = format_flex_leaderboard(entries, week_start, now)
+
+        channel = (
+            self.bot.get_channel(FLEX_LEADERBOARD_CHANNEL_ID)
+            or await self.bot.fetch_channel(FLEX_LEADERBOARD_CHANNEL_ID)
+        )
+        if channel is None:
+            print(f"[FlexLB] Could not find channel {FLEX_LEADERBOARD_CHANNEL_ID}")
+            return
+
+        await channel.send(msg)
+
+    @flex_weekly_leaderboard_task.before_loop
+    async def before_flex_weekly_leaderboard_task(self):
+        await self.bot.wait_until_ready()
+
+    @app_commands.command(
+        name="Flex_Leaderboard_Session",
+        description="Show a temporary Flex JeffBot leaderboard for the last session",
+    )
+    async def flex_leaderboard_recent(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+
+        entries, start_utc, end_utc = await compute_recent_flex_leaderboard_from_local(hours=18)
+        msg = format_recent_flex_leaderboard(entries, start_utc, end_utc)
+        await interaction.followup.send(msg)
+
 
 
 

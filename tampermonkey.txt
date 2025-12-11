@@ -1,0 +1,180 @@
+// ==UserScript==
+// @name         DPM Flex Weekly Export (JeffBot, paginated)
+// @namespace    http://tampermonkey.net/
+// @version      1.1
+// @description  Fetch Flex match-history for the squad (all pages for last week) and send to JeffBot on localhost
+// @match        https://dpm.lol/*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  "use strict";
+
+  // Must match DPM_FLEX_PROFILES in jeffbot2.py (names + puuids)
+  const PLAYERS = {
+    Blake: {
+      puuid:
+        "mV8WBqdnPXtD_grbs_nXqZXCSMfEJhnb1pW11vJXbJO7p6JqzAfbZgCYcND0DVk0R8l5gDX3AxzMOQ",
+      endpoint:
+        "https://dpm.lol/v1/players/mV8WBqdnPXtD_grbs_nXqZXCSMfEJhnb1pW11vJXbJO7p6JqzAfbZgCYcND0DVk0R8l5gDX3AxzMOQ/match-history?queue=flex",
+    },
+    Parky: {
+      puuid:
+        "c1OusXt1PnpBHUcPhYB5tVGxaaJiHtllltrNp_d8PcsXQn-YjhiBuqsziEe6ThzDCtCkebYVV-hIsQ",
+      endpoint:
+        "https://dpm.lol/v1/players/c1OusXt1PnpBHUcPhYB5tVGxaaJiHtllltrNp_d8PcsXQn-YjhiBuqsziEe6ThzDCtCkebYVV-hIsQ/match-history?queue=flex",
+    },
+    Josh: {
+      puuid:
+        "UjiUcaCRKmCMYGQ8i_9u1hVzE5GvwloxPz3vG7jR2mUgSXvItkufi4LJXGZ_54lgHB23evgqnlvNJw",
+      endpoint:
+        "https://dpm.lol/v1/players/UjiUcaCRKmCMYGQ8i_9u1hVzE5GvwloxPz3vG7jR2mUgSXvItkufi4LJXGZ_54lgHB23evgqnlvNJw/match-history?queue=flex",
+    },
+    Bi: {
+      puuid:
+        "pW0cJ9DcXsb3uj0xHwXjDsMHGPIbNEBmESbb8P8wsWli5CgmwjgM4TFPHwpd9HvcwXB7z9FzC06NSw",
+      endpoint:
+        "https://dpm.lol/v1/players/pW0cJ9DcXsb3uj0xHwXjDsMHGPIbNEBmESbb8P8wsWli5CgmwjgM4TFPHwpd9HvcwXB7z9FzC06NSw/match-history?queue=flex",
+    },
+    Cody: {
+      puuid:
+        "GWB6JRRVtuAKYufv6JSR8uY6w--dfpVM45XcM6-PuRqw-IDkamubG7KurtNTP8_jqeLWePFVmDTKuw",
+      endpoint:
+        "https://dpm.lol/v1/players/GWB6JRRVtuAKYufv6JSR8uY6w--dfpVM45XcM6-PuRqw-IDkamubG7KurtNTP8_jqeLWePFVmDTKuw/match-history?queue=flex",
+    },
+    Ash: {
+      puuid:
+        "AgW0-64FECbeS4PPlm5dRcKYsbHUFeozTqvhWYyyNcRUXaRmWRG_wZ9LDuhdkxk7sLxNwf6aUuFEEg",
+      endpoint:
+        "https://dpm.lol/v1/players/AgW0-64FECbeS4PPlm5dRcKYsbHUFeozTqvhWYyyNcRUXaRmWRG_wZ9LDuhdkxk7sLxNwf6aUuFEEg/match-history?queue=flex",
+    },
+    Oqi: {
+      puuid:
+        "I-ZkjIqVkqj64P5pUo5GGC11G2sVwh0ObHmob3MLPYr1ecaAXL5SZ1eZLNfeI4jhgJgp-HA-zAqadA",
+      endpoint:
+        "https://dpm.lol/v1/players/I-ZkjIqVkqj64P5pUo5GGC11G2sVwh0ObHmob3MLPYr1ecaAXL5SZ1eZLNfeI4jhgJgp-HA-zAqadA/match-history?queue=flex",
+    },
+    Michael: {
+      puuid:
+        "WpJkq7RYZU3FE01ehuu-oQhxL_QIJ3MilpVmVvMn9nIjdiRmXCCCPLabOGy70MS4tIL2Fq5133S_3w",
+      endpoint:
+        "https://dpm.lol/v1/players/WpJkq7RYZU3FE01ehuu-oQhxL_QIJ3MilpVmVvMn9nIjdiRmXCCCPLabOGy70MS4tIL2Fq5133S_3w/match-history?queue=flex",
+    },
+    Jeff: {
+      puuid:
+        "oGvNLx9Ie3c6WupoSfiIZJfkwTBBgUBvyQk7JzQQrvZOSRUCMOpt5TvXM8oxHQoZZxo2id4iD-MW0g",
+      endpoint:
+        "https://dpm.lol/v1/players/oGvNLx9Ie3c6WupoSfiIZJfkwTBBgUBvyQk7JzQQrvZOSRUCMOpt5TvXM8oxHQoZZxo2id4iD-MW0g/match-history?queue=flex",
+    },
+    Marcus: {
+      puuid:
+        "lBH-OgFrJw_duwOBue7X_F8G25gdMapoKPyhKihNQOyeqUZqE2N14-IBp6frvIiQ6LHGqGH2uj-XoQ",
+      endpoint:
+        "https://dpm.lol/v1/players/lBH-OgFrJw_duwOBue7X_F8G25gdMapoKPyhKihNQOyeqUZqE2N14-IBp6frvIiQ6LHGqGH2uj-XoQ/match-history?queue=flex",
+    },
+  };
+
+  const FLASK_URL = "http://127.0.0.1:5000/update_dpm";
+
+  // Assumptions:
+  // - DPM returns ~15 matches per page
+  // - Pagination is via `?page=1`, `?page=2`, etc.
+  //   (If you discover a different param name in Network tab, change pageParam.)
+  const PAGE_SIZE = 15;
+  const pageParam = "page";
+
+  async function fetchJsonWithCookies(url) {
+    const res = await fetch(url, { credentials: "include" });
+    if (!res.ok) {
+      throw new Error("HTTP " + res.status + " for " + url);
+    }
+    return res.json();
+  }
+
+  // Fetch all Flex matches for the last 7 days for one player, across pages
+  async function fetchRecentFlexMatches(info) {
+    const baseUrl = info.endpoint; // already includes ?queue=flex
+    const weekAgoMs = Date.now() - 7 * 24 * 60 * 60 * 1000;
+
+    let page = 1; // start at page 1
+    const maxPages = 10; // safety
+    const allMatches = [];
+
+    while (page <= maxPages) {
+      const sep = baseUrl.includes("?") ? "&" : "?";
+      const url = `${baseUrl}${sep}${pageParam}=${page}`;
+
+      const data = await fetchJsonWithCookies(url);
+      const matches = data.matches || [];
+
+      if (matches.length === 0) {
+        break;
+      }
+
+      allMatches.push(...matches);
+
+      const last = matches[matches.length - 1];
+      if (!last || typeof last.gameCreation !== "number") {
+        break;
+      }
+
+      // If the oldest match on this page is older than a week, stop
+      if (last.gameCreation < weekAgoMs) {
+        break;
+      }
+
+      // If fewer than a full page, we reached the end
+      if (matches.length < PAGE_SIZE) {
+        break;
+      }
+
+      page += 1;
+    }
+
+    return {
+      matches: allMatches,
+      totalCount: allMatches.length,
+    };
+  }
+
+  async function sendToLocal(profileName, puuid, data) {
+    const payload = {
+      profile: profileName,
+      puuid: puuid,
+      matches: data.matches || [],
+      totalCount: data.totalCount || 0,
+    };
+
+    await fetch(FLASK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    console.log(
+      "[DPM TM] Sent",
+      payload.matches.length,
+      "matches for",
+      profileName,
+      "to JeffBot"
+    );
+  }
+
+  async function updateAllProfiles() {
+    for (const [name, info] of Object.entries(PLAYERS)) {
+      try {
+        const data = await fetchRecentFlexMatches(info);
+        await sendToLocal(name, info.puuid, data);
+      } catch (e) {
+        console.error("[DPM TM] Error updating", name, e);
+      }
+    }
+  }
+
+  window.addEventListener("load", () => {
+    console.log("[DPM TM] Page loaded, updating Flex data for all profiles...");
+    updateAllProfiles();
+    // Refresh once a minute
+    setInterval(updateAllProfiles, 60 * 1000);
+  });
+})();
