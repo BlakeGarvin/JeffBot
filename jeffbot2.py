@@ -2885,7 +2885,7 @@ class GeneralCog(commands.Cog):
 
     @app_commands.command(
         name="weekly_flex_leaderboard",
-        description="Show this week's Flex leaderboard for the group."
+        description="show this week's flex leaderboard for the group."
     )
     async def flex_leaderboard(self, interaction: Interaction):
         # You can add permission checks here if you want
@@ -2926,8 +2926,8 @@ class GeneralCog(commands.Cog):
         await self.bot.wait_until_ready()
 
     @app_commands.command(
-        name="Flex_Leaderboard_Session",
-        description="Show a temporary Flex JeffBot leaderboard for the last session",
+        name="flex_leaderboard_session",
+        description="show a temporary flex jeffbot leaderboard for the last session",
     )
     async def flex_leaderboard_recent(self, interaction: discord.Interaction):
         await interaction.response.defer()
