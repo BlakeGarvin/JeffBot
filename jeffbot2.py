@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 from discord.ext import commands, tasks
 from discord import ButtonStyle, app_commands, Interaction
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from datetime import time as dtime  # for midnight
 from openai import AsyncOpenAI
 from urllib.parse import quote_plus, quote  # NEW: for URL‐encoding summoner names
@@ -22,6 +23,7 @@ from typing import Optional
 from flask import Flask, request
 from flask_cors import CORS
 from threading import Thread
+from playwright.async_api import async_playwright
 import tiktoken
 import re
 import random
@@ -162,6 +164,51 @@ USER_ID_MAPPING = {
 MENTION_SEP = "::"
 
 DPM_FLEX_PROFILES = {
+    "Blake": {
+        "puuid": "mV8WBqdnPXtD_grbs_nXqZXCSMfEJhnb1pW11vJXbJO7p6JqzAfbZgCYcND0DVk0R8l5gDX3AxzMOQ",
+        "opgg_url": "https://op.gg/lol/summoners/na/Schmort-bone?queue_type=FLEXRANKED",
+    },
+    "Parky": {
+        "puuid": "c1OusXt1PnpBHUcPhYB5tVGxaaJiHtllltrNp_d8PcsXQn-YjhiBuqsziEe6ThzDCtCkebYVV-hIsQ",
+        "opgg_url": "https://op.gg/lol/summoners/na/Parky-NA1?queue_type=FLEXRANKED",
+    },
+    "Josh": {
+        "puuid": "UjiUcaCRKmCMYGQ8i_9u1hVzE5GvwloxPz3vG7jR2mUgSXvItkufi4LJXGZ_54lgHB23evgqnlvNJw",
+        "opgg_url": "https://op.gg/lol/summoners/na/DrkCloak-NA1?queue_type=FLEXRANKED",
+    },
+    "Bi": {
+        "puuid": "pW0cJ9DcXsb3uj0xHwXjDsMHGPIbNEBmESbb8P8wsWli5CgmwjgM4TFPHwpd9HvcwXB7z9FzC06NSw",
+        "opgg_url": "https://op.gg/lol/summoners/na/White%20Swan-4242?queue_type=FLEXRANKED",
+    },
+    "Cody": {
+        "puuid": "GWB6JRRVtuAKYufv6JSR8uY6w--dfpVM45XcM6-PuRqw-IDkamubG7KurtNTP8_jqeLWePFVmDTKuw",
+        "opgg_url": "https://op.gg/lol/summoners/na/Cody-1414?queue_type=FLEXRANKED",
+    },
+    "Ash": {
+        "puuid": "AgW0-64FECbeS4PPlm5dRcKYsbHUFeozTqvhWYyyNcRUXaRmWRG_wZ9LDuhdkxk7sLxNwf6aUuFEEg",
+        "opgg_url": "https://op.gg/lol/summoners/na/Ash-uoplw?queue_type=FLEXRANKED",
+    },
+    "Oqi": {
+        "puuid": "I-ZkjIqVkqj64P5pUo5GGC11G2sVwh0ObHmob3MLPYr1ecaAXL5SZ1eZLNfeI4jhgJgp-HA-zAqadA",
+        "opgg_url": "https://op.gg/lol/summoners/na/Oqi-NA1?queue_type=FLEXRANKED",
+    },
+    "Michael": {
+        "puuid": "WpJkq7RYZU3FE01ehuu-oQhxL_QIJ3MilpVmVvMn9nIjdiRmXCCCPLabOGy70MS4tIL2Fq5133S_3w",
+        "opgg_url": "https://op.gg/lol/summoners/na/Madi%20Hales-NA1?queue_type=FLEXRANKED",
+    },
+    "Jeff": {
+        "puuid": "oGvNLx9Ie3c6WupoSfiIZJfkwTBBgUBvyQk7JzQQrvZOSRUCMOpt5TvXM8oxHQoZZxo2id4iD-MW0g",
+        "opgg_url": "https://op.gg/lol/summoners/na/Tacoboy7777-NA1?queue_type=FLEXRANKED",
+    },
+    "Marcus": {
+        "puuid": "lBH-OgFrJw_duwOBue7X_F8G25gdMapoKPyhKihNQOyeqUZqE2N14-IBp6frvIiQ6LHGqGH2uj-XoQ",
+        "opgg_url": "https://op.gg/lol/summoners/na/Cylainius-NOXUS?queue_type=FLEXRANKED",
+    },
+    # "Parker": { ... },
+    # etc.
+}
+
+DPM_FLEX_PROFILES_OLD = {
     "Blake": {
         "puuid": "mV8WBqdnPXtD_grbs_nXqZXCSMfEJhnb1pW11vJXbJO7p6JqzAfbZgCYcND0DVk0R8l5gDX3AxzMOQ",
         "endpoint": "https://dpm.lol/v1/players/mV8WBqdnPXtD_grbs_nXqZXCSMfEJhnb1pW11vJXbJO7p6JqzAfbZgCYcND0DVk0R8l5gDX3AxzMOQ/match-history?queue=flex",
@@ -852,13 +899,584 @@ def format_recent_flex_leaderboard(entries: list[dict], start_utc: datetime, end
     lines.append("```")
     return "\n".join(lines)
 
+def _parse_opgg_rsc_payload(text: str):
+    """
+    Returns either:
+      - dict (usually with key "data"), OR
+      - list (sometimes the parsed value *is* the list of matches)
+    """
+    for line in (text or "").splitlines():
+        if line.startswith("1:"):
+            return json.loads(line[2:].strip())
+    raise ValueError("No '1:' JSON line found in OP.GG RSC payload")
 
 
-def format_flex_leaderboard(entries: list[dict], display_start: datetime.date, display_end: datetime.date) -> str:
+
+def _find_me_in_opgg_match(match: dict) -> dict | None:
+    """Find the participant dict corresponding to match['puuid']."""
+    puuid = match.get("puuid")
+    if not isinstance(puuid, str) or not puuid:
+        return None
+
+    for team_key in ("team_blue", "team_red"):
+        team = match.get(team_key)
+        if not isinstance(team, list):
+            continue
+        for p in team:
+            if not isinstance(p, dict):
+                continue
+            summ = p.get("summoner")
+            if isinstance(summ, dict) and summ.get("puuid") == puuid:
+                return p
+    return None
+
+
+async def _fetch_opgg_flex_matches_from_url(context, opgg_url: str) -> list[dict]:
+    """
+    Returns: [{ "match_id": str, "created_at": datetime|None, "op_score": float|None }, ...]
+    Grabs the first *large* RSC payload and returns immediately (no long scroll loops).
+    """
+    page = await context.new_page()
+
+    best_body: str | None = None
+    got_payload = asyncio.Event()
+
+    async def on_response(resp):
+        nonlocal best_body
+        try:
+            if "op.gg" not in (resp.url or ""):
+                return
+            ctype = (resp.headers.get("content-type") or "").lower()
+            if "text/x-component" not in ctype:
+                return
+
+            body = await resp.text()
+            if not body:
+                return
+
+            # Your log spam is fine; keep it if you want:
+            print(f"[OPGG] RSC resp {resp.status} size={len(body)} url={resp.url}")
+
+            # Heuristic: the real payload is large and contains a "1:" JSON line
+            # (the tiny 53/215/693 ones are fragments)
+            if len(body) > 50_000 and "\n1:" in body:
+                # keep the biggest one we’ve seen
+                if best_body is None or len(body) > len(best_body):
+                    best_body = body
+                got_payload.set()
+        except Exception:
+            pass
+
+    page.on("response", on_response)
+
+    try:
+        await page.goto(opgg_url, wait_until="domcontentloaded", timeout=60_000)
+
+        # Give the page time to kick off its RSC requests.
+        # OP.GG can be slow / bursty; a slightly longer settle helps a lot.
+        try:
+            await page.wait_for_load_state("networkidle", timeout=20_000)
+        except Exception:
+            # networkidle isn't always achievable on SPAs; that's fine.
+            pass
+
+        await page.wait_for_timeout(1500)
+
+        # Wait up to 25s for the big payload
+        await asyncio.wait_for(got_payload.wait(), timeout=25)
+
+    except Exception as e:
+        # If we never got a big payload, bail cleanly
+        # (This prevents your gather wrapper from swallowing everything.)
+        return []
+    finally:
+        try:
+            await page.close()
+        except Exception:
+            pass
+
+    if not best_body:
+        return []
+
+    # Parse the biggest captured payload
+    payload = _parse_opgg_rsc_payload(best_body)
+
+    # OP.GG sometimes returns dict {"data":[...]} and sometimes returns the list directly.
+    if isinstance(payload, dict):
+        data = payload.get("data")
+    elif isinstance(payload, list):
+        data = payload
+    else:
+        return []
+
+    if not isinstance(data, list):
+        return []
+
+
+    out: list[dict] = []
+    for m in data:
+        if not isinstance(m, dict):
+            continue
+
+        match_id = m.get("id")
+        created_at_s = m.get("created_at")
+
+        if not isinstance(match_id, str) or not match_id:
+            continue
+
+        created_dt = None
+        if isinstance(created_at_s, str) and created_at_s and not created_at_s.startswith("$"):
+            try:
+                created_dt = datetime.fromisoformat(created_at_s)
+            except Exception:
+                created_dt = None
+
+        me = _find_me_in_opgg_match(m)
+        op_score = None
+        if isinstance(me, dict):
+            stats = me.get("stats")
+            if isinstance(stats, dict):
+                v = stats.get("op_score")
+                if isinstance(v, (int, float)):
+                    op_score = float(v)
+
+        out.append({"match_id": match_id, "created_at": created_dt, "op_score": op_score})
+
+    return out
+
+
+
+# =========================
+# OP.GG Flex persistent cache
+# =========================
+
+FLEX_OPGG_CACHE_FILE = os.path.join(os.path.dirname(__file__), "opgg_flex_cache.json")
+
+_OPGG_FLEX_CACHE: dict | None = None
+_OPGG_FLEX_CACHE_LAST_REFRESH_UTC: datetime | None = None
+
+# Timezone helpers (keep internal math in UTC; interpret naive datetimes as America/Detroit for safety)
+def _get_detroit_tz():
+    """Return a tzinfo for America/Detroit.
+
+    On some Windows installs, Python's zoneinfo database is unavailable unless the third-party
+    'tzdata' package is installed. We try ZoneInfo first, then fall back to dateutil (if present),
+    and finally to a fixed -05:00 offset (no DST awareness) as a last resort.
+    """
+    try:
+        return ZoneInfo("America/Detroit")
+    except Exception:
+        try:
+            from dateutil import tz as dateutil_tz  # type: ignore
+            tzinfo = dateutil_tz.gettz("America/Detroit")
+            if tzinfo is not None:
+                return tzinfo
+        except Exception:
+            pass
+        return timezone(timedelta(hours=-5))
+
+DETROIT_TZ = _get_detroit_tz()
+
+def _coerce_dt_to_utc(dt: datetime) -> datetime:
+    """Return an aware UTC datetime.
+
+    - If dt is tz-aware: convert to UTC.
+    - If dt is naive: assume America/Detroit (matches how users reason about timestamps) then convert to UTC.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=DETROIT_TZ)
+    return dt.astimezone(timezone.utc)
+
+
+def _load_opgg_flex_cache() -> dict:
+    """Load cache from disk (best effort)."""
+    global _OPGG_FLEX_CACHE
+    if _OPGG_FLEX_CACHE is not None:
+        return _OPGG_FLEX_CACHE
+
+    base = {"version": 1, "updated_at": None, "profiles": {}}
+    try:
+        if os.path.exists(FLEX_OPGG_CACHE_FILE):
+            with open(FLEX_OPGG_CACHE_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f) or {}
+            # normalize structure
+            profiles = raw.get("profiles") or {}
+            base["profiles"] = profiles
+            base["updated_at"] = raw.get("updated_at")
+    except Exception as e:
+        print(f"[OPGG][cache] failed to load cache: {type(e).__name__}: {e}")
+
+    _OPGG_FLEX_CACHE = base
+    return _OPGG_FLEX_CACHE
+
+
+def _save_opgg_flex_cache(cache: dict) -> None:
+    """Persist cache to disk (best effort)."""
+    try:
+        tmp_path = FLEX_OPGG_CACHE_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2, default=str)
+        os.replace(tmp_path, FLEX_OPGG_CACHE_FILE)
+    except Exception as e:
+        print(f"[OPGG][cache] failed to save cache: {type(e).__name__}: {e}")
+
+
+def _cache_upsert_matches(player_name: str, matches: list[dict]) -> int:
+    """Insert new matches into cache for a player. Returns count inserted."""
+    cache = _load_opgg_flex_cache()
+    profiles = cache.setdefault("profiles", {})
+    player_bucket = profiles.setdefault(player_name, {})  # match_id -> payload
+
+    inserted = 0
+    for m in matches or []:
+        match_id = m.get("match_id")
+        if not match_id:
+            continue
+
+        if match_id in player_bucket:
+            # already have it
+            continue
+
+        created = m.get("created_at")
+        created_iso = None
+        if isinstance(created, datetime):
+            # store as ISO string (UTC)
+            created_utc = _coerce_dt_to_utc(created)
+            created_iso = created_utc.isoformat()
+        elif isinstance(created, str):
+            created_iso = created
+
+        player_bucket[match_id] = {
+            "match_id": match_id,
+            "created_at": created_iso,
+            "op_score": m.get("op_score"),
+        }
+        inserted += 1
+
+    cache["updated_at"] = datetime.now(timezone.utc).isoformat()
+    _save_opgg_flex_cache(cache)
+    return inserted
+
+
+def _iter_cached_matches(player_name: str) -> list[dict]:
+    cache = _load_opgg_flex_cache()
+    bucket = (cache.get("profiles") or {}).get(player_name, {}) or {}
+    out: list[dict] = []
+    for match_id, payload in bucket.items():
+        created_iso = payload.get("created_at")
+        created_dt = None
+        if isinstance(created_iso, str) and created_iso:
+            try:
+                created_dt = datetime.fromisoformat(created_iso)
+            except Exception:
+                created_dt = None
+
+        out.append(
+            {
+                "match_id": payload.get("match_id") or match_id,
+                "created_at": created_dt,
+                "op_score": payload.get("op_score"),
+            }
+        )
+    return out
+
+
+async def refresh_opgg_flex_cache_best_effort(reason: str = "manual") -> None:
+    """
+    Refresh cache by scraping the most recent Flex matches from each tracked OP.GG profile.
+    Best-effort: failures for one profile won't fail the whole refresh.
+    """
+    global _OPGG_FLEX_CACHE_LAST_REFRESH_UTC
+
+    # avoid refresh storms (e.g., multiple commands at once)
+    now_utc = datetime.now(timezone.utc)
+    if _OPGG_FLEX_CACHE_LAST_REFRESH_UTC and (now_utc - _OPGG_FLEX_CACHE_LAST_REFRESH_UTC).total_seconds() < 20:
+        return
+
+    _OPGG_FLEX_CACHE_LAST_REFRESH_UTC = now_utc
+    _load_opgg_flex_cache()
+
+    if not DPM_FLEX_PROFILES:
+        return
+
+    try:
+        from playwright.async_api import async_playwright
+    except Exception as e:
+        print(f"[OPGG][cache] Playwright not available: {type(e).__name__}: {e}")
+        return
+
+    print(f"[OPGG][cache] refresh start ({reason})")
+
+    async with async_playwright() as p:
+        # You asked for headless=False so you can watch it scrape.
+        browser = await p.chromium.launch(headless=False)
+        context = await browser.new_context(locale="en-US")
+
+        try:
+            names = list(DPM_FLEX_PROFILES.keys())
+            tasks = []
+            for name in names:
+                prof = DPM_FLEX_PROFILES.get(name) or {}
+                url = prof.get("opgg_url") if isinstance(prof, dict) else None
+                if not isinstance(url, str) or not url:
+                    print(f"[OPGG][cache] missing opgg_url for {name}")
+                    continue
+                tasks.append(_fetch_opgg_flex_matches_from_url(context, url))
+
+            done = await asyncio.gather(*tasks, return_exceptions=True)
+
+            total_inserted = 0
+            # Note: tasks list may be shorter if a profile is missing a URL.
+            for name, res in zip([n for n in names if isinstance((DPM_FLEX_PROFILES.get(n) or {}).get("opgg_url"), str)], done):
+                if isinstance(res, Exception):
+                    print(f"[OPGG][cache] scrape failed for {name}: {type(res).__name__}: {res}")
+                    continue
+                inserted = _cache_upsert_matches(name, res or [])
+                total_inserted += inserted
+
+            print(f"[OPGG][cache] refresh done ({reason}) inserted={total_inserted}")
+        finally:
+            await context.close()
+            await browser.close()
+
+
+async def compute_recent_flex_leaderboard_from_opgg_cache(hours: int = 18) -> tuple[list[dict], datetime, datetime]:
+    """Compute a temporary leaderboard from cached OP.GG matches in the last `hours`."""
+    now_utc = datetime.now(timezone.utc)
+    start_utc = now_utc - timedelta(hours=hours)
+
+    # Build match_id -> set(profiles) for matches within window
+    match_to_profiles: dict[str, set[str]] = {}
+
+    per_player_matches: dict[str, list[dict]] = {}
+    for name in DPM_FLEX_PROFILES.keys():
+        ms = _iter_cached_matches(name)
+        per_player_matches[name] = ms
+        for m in ms:
+            created = m.get("created_at")
+            if not isinstance(created, datetime):
+                continue
+            created_utc = _coerce_dt_to_utc(created)
+            if not (start_utc <= created_utc <= now_utc):
+                continue
+            match_id = m.get("match_id")
+            if match_id:
+                match_to_profiles.setdefault(match_id, set()).add(name)
+
+    entries: list[dict] = []
+    for name in DPM_FLEX_PROFILES.keys():
+        scores: list[float] = []
+        for m in per_player_matches.get(name, []) or []:
+            match_id = m.get("match_id")
+            if not match_id:
+                continue
+
+            created = m.get("created_at")
+            if not isinstance(created, datetime):
+                continue
+            created_utc = _coerce_dt_to_utc(created)
+
+            if not (start_utc <= created_utc <= now_utc):
+                continue
+
+            if len(match_to_profiles.get(match_id, set())) < MIN_GROUP_PLAYERS_IN_GAME:
+                continue
+
+            op_score = m.get("op_score")
+            if isinstance(op_score, (int, float)):
+                scores.append(float(op_score))
+
+        if scores:
+            entries.append({"name": name, "games": len(scores), "avg": sum(scores) / len(scores)})
+
+    entries.sort(key=lambda e: e["avg"], reverse=True)
+    return entries, start_utc, now_utc
+
+
+
+
+async def compute_weekly_flex_leaderboard_from_opgg_cache(days: int = 7) -> tuple[list[dict], datetime, datetime]:
+    """Rolling window leaderboard from cache.
+
+    By default, looks back the last `days` days from *right now* (UTC).
+    This is intentionally NOT Sunday-to-Sunday so you can test cache behavior easily.
+    """
+    now_utc = datetime.now(timezone.utc)
+    start_utc = now_utc - timedelta(days=days)
+
+    per_player_matches: dict[str, list[dict]] = {}
+    match_to_profiles: dict[str, set[str]] = {}
+
+    # Build mapping of match_id -> {profiles} for group-size filtering within the rolling window.
+    for name in DPM_FLEX_PROFILES.keys():
+        ms = _iter_cached_matches(name)
+        per_player_matches[name] = ms
+        for m in ms:
+            created = m.get("created_at")
+            if not isinstance(created, datetime):
+                continue
+            created_utc = _coerce_dt_to_utc(created)
+
+            if not (start_utc <= created_utc <= now_utc):
+                continue
+
+            match_id = m.get("match_id")
+            if not match_id:
+                continue
+            match_to_profiles.setdefault(match_id, set()).add(name)
+
+    entries: list[dict] = []
+    for name in DPM_FLEX_PROFILES.keys():
+        scores: list[float] = []
+        for m in per_player_matches.get(name, []) or []:
+            match_id = m.get("match_id")
+            if not match_id:
+                continue
+
+            created = m.get("created_at")
+            if not isinstance(created, datetime):
+                continue
+            created_utc = _coerce_dt_to_utc(created)
+
+            if not (start_utc <= created_utc <= now_utc):
+                continue
+
+            if len(match_to_profiles.get(match_id, set())) < MIN_GROUP_PLAYERS_IN_GAME:
+                continue
+
+            op_score = m.get("op_score")
+            if isinstance(op_score, (int, float)):
+                scores.append(float(op_score))
+
+        # Keep weekly minimums for your "real" weekly command;
+        # for testing you can temporarily set MIN_FLEX_GAMES_PER_WEEK=0 if you want.
+        if len(scores) >= MIN_FLEX_GAMES_PER_WEEK:
+            entries.append({"name": name, "games": len(scores), "avg": sum(scores) / len(scores)})
+
+    entries.sort(key=lambda e: e["avg"], reverse=True)
+    return entries, start_utc, now_utc
+async def compute_weekly_flex_leaderboard_from_opgg() -> tuple[list[dict], datetime.date, datetime.date]:
+    """
+    Replacement for compute_weekly_flex_leaderboard_from_local().
+    Uses OP.GG 'OP score' for FLEXRANKED match list.
+    Enforces:
+      - match is within last completed week window
+      - match_id shared by at least MIN_GROUP_PLAYERS_IN_GAME tracked profiles
+      - min games per player: MIN_FLEX_GAMES_PER_WEEK
+    """
+    if not DPM_FLEX_PROFILES:
+        week_start_utc, week_end_utc, display_start, display_end = get_last_completed_week_window()
+        return [], display_start, display_end
+
+    week_start_utc, week_end_utc, display_start, display_end = get_last_completed_week_window()
+
+    # 1) Pull match lists for each profile
+    results_by_name: dict[str, list[dict]] = {}
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=False)
+        context = await browser.new_context(locale="en-US")
+
+        async def fetch_one(name: str, url: str) -> list[dict]:
+            # hard cap each profile scrape to 25s
+            return await asyncio.wait_for(
+                _fetch_opgg_flex_matches_from_url(context, url),
+                timeout=25,
+            )
+
+        tasks = []
+        names = []
+        for name, prof in DPM_FLEX_PROFILES.items():
+            opgg_url = prof.get("opgg_url")
+            if not opgg_url:
+                results_by_name[name] = []
+                continue
+            names.append(name)
+            tasks.append(fetch_one(name, opgg_url))
+
+        # Run all profile scrapes in parallel
+        done = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for name, res in zip(names, done):
+            if isinstance(res, Exception):
+                print(f"[OPGG] scrape failed for {name}: {type(res).__name__}: {res}")
+                results_by_name[name] = []
+            else:
+                results_by_name[name] = res
+        for name, ms in results_by_name.items():
+            print(f"[OPGG] {name}: matches scraped = {len(ms or [])}")
+
+
+        await context.close()
+        await browser.close()
+
+    # 2) Build match_id -> set(names) for matches in the week window
+    match_to_profiles: dict[str, set[str]] = {}
+
+    for name, matches in results_by_name.items():
+        for m in matches or []:
+            created = m.get("created_at")
+            if not isinstance(created, datetime):
+                continue
+
+            # Convert to UTC for comparison (created may have +09:00)
+            created_utc = _coerce_dt_to_utc(created)
+
+            if not (week_start_utc <= created_utc < week_end_utc):
+                continue
+
+            match_id = m.get("match_id")
+            if isinstance(match_id, str) and match_id:
+                match_to_profiles.setdefault(match_id, set()).add(name)
+
+    # 3) Compute per-player averages using only group games (>=4 tracked in same match_id)
+    entries: list[dict] = []
+
+    for name in DPM_FLEX_PROFILES.keys():
+        matches = results_by_name.get(name, []) or []
+        scores: list[float] = []
+
+        for m in matches:
+            created = m.get("created_at")
+            if not isinstance(created, datetime):
+                continue
+
+            created_utc = _coerce_dt_to_utc(created)
+
+            if not (week_start_utc <= created_utc < week_end_utc):
+                continue
+
+            match_id = m.get("match_id")
+            if not isinstance(match_id, str) or not match_id:
+                continue
+
+            if len(match_to_profiles.get(match_id, set())) < MIN_GROUP_PLAYERS_IN_GAME:
+                continue
+
+            op_score = m.get("op_score")
+            if isinstance(op_score, (int, float)):
+                scores.append(float(op_score))
+
+        if len(scores) >= MIN_FLEX_GAMES_PER_WEEK:
+            avg = sum(scores) / len(scores)
+            entries.append({"name": name, "games": len(scores), "avg": avg})
+
+    entries.sort(key=lambda e: e["avg"], reverse=True)
+
+    # reuse your existing history/delta logic by leaving the rest of your pipeline as-is
+    return entries, display_start, display_end
+
+
+def format_flex_leaderboard(entries: list[dict], display_start, display_end) -> str:
     MEDALS = ["🥇", "🥈", "🥉"]
 
-    start_str = display_start.strftime("%m-%d")
-    end_str = display_end.strftime("%m-%d")
+    def _fmt_window(x):
+        return x.strftime("%m-%d %H:%M") if hasattr(x, "hour") else x.strftime("%m-%d")
+
+    start_str = _fmt_window(display_start)
+    end_str = _fmt_window(display_end)
 
 
     if not entries:
@@ -2446,6 +3064,21 @@ class GeneralCog(commands.Cog):
         # Start the weekly Flex leaderboard task (auto-post)
         self.flex_weekly_leaderboard_task.start()
 
+        # Keep OP.GG cache warm so slash commands don't depend on a live scrape.
+        # Runs every 30 minutes (headless; no browser window).
+        self.flex_opgg_cache_refresh_task.start()
+
+    def cog_unload(self):
+        # Stop background tasks cleanly
+        try:
+            self.flex_weekly_leaderboard_task.cancel()
+        except Exception:
+            pass
+        try:
+            self.flex_opgg_cache_refresh_task.cancel()
+        except Exception:
+            pass
+
     @app_commands.command(name="ask", description="Ask the bot a question (optional: '(2hrs) question...' for context)")
     async def ask(self, interaction: Interaction, question: str):
         # HARD IGNORE: if user is ignored, completely ignore (no response)
@@ -2891,13 +3524,28 @@ class GeneralCog(commands.Cog):
         # You can add permission checks here if you want
         await interaction.response.defer(thinking=True)
 
-        entries, week_start, now = await compute_weekly_flex_leaderboard_from_local()
+        await refresh_opgg_flex_cache_best_effort(reason="command")
+        entries, week_start, now = await compute_weekly_flex_leaderboard_from_opgg_cache()
         msg = format_flex_leaderboard(entries, week_start, now)
 
         # Manual mode: post to the channel where the slash command was used
         await interaction.followup.send(msg)
 
-        # Runs every day at local midnight; only posts on Monday 00:00 local
+    # -------------------------------
+    # OP.GG cache refresher
+    # -------------------------------
+    @tasks.loop(minutes=30)
+    async def flex_opgg_cache_refresh_task(self):
+        await self.bot.wait_until_ready()
+        await refresh_opgg_flex_cache_best_effort(reason="loop")
+
+    @flex_opgg_cache_refresh_task.before_loop
+    async def before_flex_opgg_cache_refresh_task(self):
+        await self.bot.wait_until_ready()
+        # Prime the cache once at startup so /weekly_flex_leaderboard works immediately.
+        await refresh_opgg_flex_cache_best_effort(reason="startup")
+
+    # Runs every day at local midnight; only posts on Monday 00:00 local
     # which is effectively "Sunday night at midnight".
     @tasks.loop(time=dtime(hour=0, minute=0, tzinfo=LOCAL_TIMEZONE))
     async def flex_weekly_leaderboard_task(self):
@@ -2908,7 +3556,8 @@ class GeneralCog(commands.Cog):
         if now_local.weekday() != 0:
             return
 
-        entries, week_start, now = await compute_weekly_flex_leaderboard_from_local()
+        await refresh_opgg_flex_cache_best_effort(reason="command")
+        entries, week_start, now = await compute_weekly_flex_leaderboard_from_opgg_cache()
         msg = format_flex_leaderboard(entries, week_start, now)
 
         channel = (
@@ -2932,7 +3581,9 @@ class GeneralCog(commands.Cog):
     async def flex_leaderboard_recent(self, interaction: discord.Interaction):
         await interaction.response.defer()
 
-        entries, start_utc, end_utc = await compute_recent_flex_leaderboard_from_local(hours=18)
+        # Uses the OP.GG cache (auto-refreshed every 30 minutes) so we don't
+        # depend on the DPM site being up and we can accumulate >20 matches over time.
+        entries, start_utc, end_utc = await compute_recent_flex_leaderboard_from_opgg_cache(hours=18)
         msg = format_recent_flex_leaderboard(entries, start_utc, end_utc)
         await interaction.followup.send(msg)
 
