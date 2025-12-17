@@ -535,7 +535,66 @@ async def _riot_get_json(session: aiohttp.ClientSession, url: str, api_key: str)
         return await resp.json()
     
 
-# ---------- DPM Flex weekly leaderboard helpers ----------
+
+
+# -------------------------------
+# Lenny counter persistence
+# -------------------------------
+LENNY_TARGET_USER_ID = 184481785172721665
+LENNY_CHANNEL_ID = 753959443263389737  # optional filter (you can remove if you want all channels)
+
+LENNY_STATS_FILE = os.path.join(SCRIPT_DIR, "lenny_stats.json")
+_lenny_stats = {"total": 0, "by_day": {}}  # day is YYYY-MM-DD (America/Detroit)
+_lenny_lock = asyncio.Lock()
+
+# whole-word match for "lenny" or "lennert" (any caps)
+_LENNY_RE = re.compile(r"\b(lenny|lennert)\b", re.IGNORECASE)
+
+async def load_lenny_stats():
+    global _lenny_stats
+    if os.path.exists(LENNY_STATS_FILE):
+        try:
+            async with aiofiles.open(LENNY_STATS_FILE, "r") as f:
+                _lenny_stats = json.loads(await f.read()) or {"total": 0, "by_day": {}}
+        except Exception:
+            _lenny_stats = {"total": 0, "by_day": {}}
+    else:
+        _lenny_stats = {"total": 0, "by_day": {}}
+
+async def save_lenny_stats():
+    async with aiofiles.open(LENNY_STATS_FILE, "w") as f:
+        await f.write(json.dumps(_lenny_stats, indent=2))
+
+def _detroit_day_str(dt_aware_utc: datetime) -> str:
+    # message.created_at is aware UTC in discord.py
+    local = dt_aware_utc.astimezone(DETROIT_TZ)
+    return local.date().isoformat()
+
+async def record_lenny_if_needed(message: discord.Message):
+    # Only count target user
+    if message.author.id != LENNY_TARGET_USER_ID:
+        return
+
+    # Optional: only count in one channel
+    if LENNY_CHANNEL_ID and message.channel.id != LENNY_CHANNEL_ID:
+        return
+
+    content = message.content or ""
+    if not content:
+        return
+
+    hits = len(_LENNY_RE.findall(content))
+    if hits <= 0:
+        return
+
+    day = _detroit_day_str(message.created_at)
+
+    async with _lenny_lock:
+        _lenny_stats["total"] = int(_lenny_stats.get("total", 0)) + hits
+        by_day = _lenny_stats.setdefault("by_day", {})
+        by_day[day] = int(by_day.get(day, 0)) + hits
+        await save_lenny_stats()
+
 
 # ---------- DPM Flex Weekly Leaderboard Helpers (using local Tampermonkey data) ----------
 
@@ -2464,6 +2523,7 @@ async def on_ready():
     await bot.add_cog(ShopCog(bot))
     await bot.add_cog(RPSCog(bot))
     await bot.add_cog(CustomsCog(bot))
+    
 
     guild_ids = [
         1086751625324003369,
@@ -2491,6 +2551,7 @@ async def on_ready():
     await load_messages()
     await load_balances()
     await load_daily_cooldowns()
+    await load_lenny_stats()
 
     # NEW: load ignore & spam persistence
     await load_ignore_and_spam_state()
@@ -2507,6 +2568,9 @@ async def on_message(message: discord.Message):
     # Ignore the bot’s own messages
     if message.author.id == bot.user.id:
         return
+    
+    # Track "lenny/lennert" usage for Jeff (persistent)
+    await record_lenny_if_needed(message)
 
     # HARD IGNORE: if user is in ignore list, ignore EVERY message (no processing, no responses)
     if is_ignored(message.author.id):
@@ -3586,6 +3650,38 @@ class GeneralCog(commands.Cog):
         entries, start_utc, end_utc = await compute_recent_flex_leaderboard_from_opgg_cache(hours=18)
         msg = format_recent_flex_leaderboard(entries, start_utc, end_utc)
         await interaction.followup.send(msg)
+
+    @app_commands.command(
+        name="lenny",
+        description="Show Jeff's lifetime 'lenny' count and record day."
+    )
+    async def lenny(self, interaction: discord.Interaction):
+        async with _lenny_lock:
+            total = int(_lenny_stats.get("total", 0))
+            by_day = _lenny_stats.get("by_day", {}) or {}
+
+            if by_day:
+                record_day, record_count = max(by_day.items(), key=lambda kv: kv[1])
+            else:
+                record_day, record_count = None, 0
+
+        if record_day:
+            msg = (
+                "**Jeff Total Lifetime Lenny Count:**\n"
+                f"                  🔥 **{total}** 🔥\n\n"
+                "**Most Lenny’s Record:**\n"
+                f"📅 **{record_day}** -> **{record_count}**"
+            )
+        else:
+            msg = (
+                "**Jeff Total Lifetime Lenny Count:**\n"
+                f"                  🔥 **{total}** 🔥\n\n"
+                "**Most Lenny’s Record:**\n"
+                "📅 *No record yet*"
+            )
+
+        await interaction.response.send_message(msg, ephemeral=False)
+
 
 
 
