@@ -48,6 +48,7 @@ DRAFTLOL_BASE_URL = "https://draftlol.dawe.gg"
 
 FLEX_LEADERBOARD_HISTORY_FILE = "flex_leaderboard_history.json"
 
+
 # List of channel IDs to collect messages from
 TARGET_CHANNEL_IDS = [753959443263389737, 781309198855438336]
 
@@ -58,6 +59,8 @@ MESSAGES_FILE = os.path.join(SCRIPT_DIR, 'user_messages.json')
 SUMMARY_FILE = os.path.join(SCRIPT_DIR, 'user_summary.txt')
 BALANCES_FILE = os.path.join(SCRIPT_DIR, 'user_balances.json')
 DAILY_COOLDOWN_FILE = os.path.join(SCRIPT_DIR, 'daily_cooldowns.json')
+FLEX_RANK_SNAPSHOTS_FILE = os.path.join(SCRIPT_DIR, "flex_rank_snapshots.json")
+
 
 
 USE_SUMMARY_FOR_CONTEXT = False
@@ -263,7 +266,7 @@ DPM_FLEX_PROFILES_OLD = {
 FLEX_LEADERBOARD_CHANNEL_ID = 753959443263389737
 MIN_FLEX_GAMES_PER_WEEK = 5  # only rank players with at least this many games this week
 FLEX_QUEUE_ID = 440          # DPM uses 440 for Ranked Flex
-MIN_GROUP_PLAYERS_IN_GAME = 4
+MIN_GROUP_PLAYERS_IN_GAME = 5
 dpm_latest_matches_by_profile: dict[str, list[dict]] = {}
 
 # ---------- Flask app to receive DPM data from Tampermonkey ----------
@@ -535,6 +538,79 @@ async def _riot_get_json(session: aiohttp.ClientSession, url: str, api_key: str)
             raise RuntimeError(f"Riot API error {resp.status} for {url}: {text[:200]}")
         return await resp.json()
     
+def _detroit_day_str_from_utc(dt_utc: datetime) -> str:
+    # dt_utc should be aware UTC
+    local = dt_utc.astimezone(DETROIT_TZ)
+    return local.date().isoformat()
+
+def _load_flex_rank_snapshots() -> dict:
+    """
+    Shape:
+      { "version": 1, "snapshots": [ { "day": "YYYY-MM-DD", "ts": "ISO_UTC", "ranks": [names...] }, ... ] }
+    """
+    base = {"version": 1, "snapshots": []}
+    if not os.path.exists(FLEX_RANK_SNAPSHOTS_FILE):
+        return base
+    try:
+        with open(FLEX_RANK_SNAPSHOTS_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f) or {}
+        snaps = raw.get("snapshots") or []
+        if isinstance(snaps, list):
+            base["snapshots"] = snaps
+        return base
+    except Exception as e:
+        print(f"[FlexLB] Error loading rank snapshots: {e}")
+        return base
+
+def _save_flex_rank_snapshots(data: dict) -> None:
+    try:
+        with open(FLEX_RANK_SNAPSHOTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"[FlexLB] Error saving rank snapshots: {e}")
+
+def _get_latest_snapshot_for_day(day_str: str) -> list[str] | None:
+    data = _load_flex_rank_snapshots()
+    best_ts = None
+    best_ranks = None
+    for s in data.get("snapshots", []) or []:
+        if not isinstance(s, dict):
+            continue
+        if s.get("day") != day_str:
+            continue
+        ts = s.get("ts")
+        ranks = s.get("ranks")
+        if not isinstance(ts, str) or not isinstance(ranks, list):
+            continue
+        # ISO UTC strings sort correctly lexicographically if they’re real ISO datetimes
+        if best_ts is None or ts > best_ts:
+            best_ts = ts
+            best_ranks = [str(x) for x in ranks]
+    return best_ranks
+
+def _upsert_latest_snapshot_for_today(entries: list[dict], now_utc: datetime) -> None:
+    """
+    Stores ONE snapshot per Detroit day: the latest call that day wins.
+    """
+    day_str = _detroit_day_str_from_utc(now_utc)
+    ts = now_utc.astimezone(timezone.utc).isoformat()
+
+    ranks = [e["name"] for e in entries]  # already sorted best->worst
+    data = _load_flex_rank_snapshots()
+
+    # Remove existing snapshot(s) for this day; we keep only the latest for that day.
+    snaps = [s for s in (data.get("snapshots") or []) if not (isinstance(s, dict) and s.get("day") == day_str)]
+    snaps.append({"day": day_str, "ts": ts, "ranks": ranks})
+
+    # Optional pruning: keep last 45 days only (prevents file growth)
+    cutoff_day = (now_utc.astimezone(DETROIT_TZ).date() - timedelta(days=45)).isoformat()
+    pruned = []
+    for s in snaps:
+        if isinstance(s, dict) and isinstance(s.get("day"), str) and s["day"] >= cutoff_day:
+            pruned.append(s)
+
+    data["snapshots"] = pruned
+    _save_flex_rank_snapshots(data)
 
 
 
@@ -1419,7 +1495,27 @@ async def compute_weekly_flex_leaderboard_from_opgg_cache(days: int = 7) -> tupl
             entries.append({"name": name, "games": len(scores), "avg": sum(scores) / len(scores)})
 
     entries.sort(key=lambda e: e["avg"], reverse=True)
+
+    # --- CHANGE COLUMN: compare to latest snapshot from Detroit date exactly 7 days ago ---
+    today_detroit = now_utc.astimezone(DETROIT_TZ).date()
+    target_day = (today_detroit - timedelta(days=7)).isoformat()
+
+    old_ranks = _get_latest_snapshot_for_day(target_day)
+    old_positions = {name: idx + 1 for idx, name in enumerate(old_ranks or [])}
+
+    for idx, e in enumerate(entries):
+        new_pos = idx + 1
+        old_pos = old_positions.get(e["name"])
+        if old_pos is None:
+            e["delta"] = None   # formatter will show NEW (we’ll change formatter next)
+        else:
+            e["delta"] = old_pos - new_pos  # positive = moved up
+
+    # Save today's snapshot (latest call of the day wins)
+    _upsert_latest_snapshot_for_today(entries, now_utc)
+
     return entries, start_utc, now_utc
+
 async def compute_weekly_flex_leaderboard_from_opgg() -> tuple[list[dict], datetime.date, datetime.date]:
     """
     Replacement for compute_weekly_flex_leaderboard_from_local().
@@ -1571,7 +1667,9 @@ def format_flex_leaderboard(entries: list[dict], display_start, display_end) -> 
     change_col = []
     for e in entries:
         delta = e.get("delta")
-        if delta is None or delta == 0:
+        if delta is None:
+            change_col.append("NEW")
+        elif delta == 0:
             change_col.append("-")
         elif delta > 0:
             change_col.append(f"+{delta}")
@@ -1733,7 +1831,7 @@ async def compute_weekly_flex_leaderboard() -> tuple[list[dict], datetime, datet
     # "At least 4/5 of the people from the list are in the game"
     # Generalized to ceil(0.8 * N) so it still works if you ever add/remove people.
     import math as _math
-    min_group_size = max(1, _math.ceil(0.8 * len(tracked_puuids)))
+    min_group_size = max(1, _math.ceil(1 * len(tracked_puuids)))
 
     entries: list[dict] = []
 
