@@ -29,6 +29,7 @@ import re
 import random
 
 load_dotenv()
+_opgg_refresh_lock = asyncio.Lock()
 client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 
@@ -1029,6 +1030,9 @@ async def _fetch_opgg_flex_matches_from_url(context, opgg_url: str) -> list[dict
     page.on("response", on_response)
 
     try:
+        cache_bust = int(time.time())
+        sep = "&" if "?" in opgg_url else "?"
+        url = f"{opgg_url}{sep}t={cache_bust}"
         await page.goto(opgg_url, wait_until="domcontentloaded", timeout=60_000)
 
         # Give the page time to kick off its RSC requests.
@@ -2506,6 +2510,17 @@ def format_reply_chain_block(chain_msgs: list[discord.Message]) -> str:
 
 _ready_synced = False
 
+@tasks.loop(minutes=30)
+async def opgg_cache_refresh_loop():
+    if _opgg_refresh_lock.locked():
+        return
+    async with _opgg_refresh_lock:
+        await refresh_opgg_flex_cache_best_effort(reason="loop_30m")
+
+@opgg_cache_refresh_loop.before_loop
+async def _before_opgg_cache_refresh_loop():
+    await bot.wait_until_ready()
+
 @bot.event
 async def on_ready():
     global _ready_synced
@@ -2523,6 +2538,9 @@ async def on_ready():
     await bot.add_cog(ShopCog(bot))
     await bot.add_cog(RPSCog(bot))
     await bot.add_cog(CustomsCog(bot))
+
+    if not opgg_cache_refresh_loop.is_running():
+        opgg_cache_refresh_loop.start()
     
 
     guild_ids = [
@@ -3603,6 +3621,8 @@ class GeneralCog(commands.Cog):
         await self.bot.wait_until_ready()
         await refresh_opgg_flex_cache_best_effort(reason="loop")
 
+    
+
     @flex_opgg_cache_refresh_task.before_loop
     async def before_flex_opgg_cache_refresh_task(self):
         await self.bot.wait_until_ready()
@@ -3647,6 +3667,7 @@ class GeneralCog(commands.Cog):
 
         # Uses the OP.GG cache (auto-refreshed every 30 minutes) so we don't
         # depend on the DPM site being up and we can accumulate >20 matches over time.
+        await refresh_opgg_flex_cache_best_effort(reason="post_leaderboard")
         entries, start_utc, end_utc = await compute_recent_flex_leaderboard_from_opgg_cache(hours=18)
         msg = format_recent_flex_leaderboard(entries, start_utc, end_utc)
         await interaction.followup.send(msg)
