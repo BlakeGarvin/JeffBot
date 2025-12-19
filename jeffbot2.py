@@ -3700,11 +3700,15 @@ class GeneralCog(commands.Cog):
         name="weekly_flex_leaderboard",
         description="show this week's flex leaderboard for the group."
     )
-    async def flex_leaderboard(self, interaction: Interaction):
+    @app_commands.describe(refresh='Optional: "1" to refresh data first, blank or "0" to skip')
+    async def flex_leaderboard(self, interaction: Interaction, refresh: str | None = None):
         # You can add permission checks here if you want
         await interaction.response.defer(thinking=True)
 
-        await refresh_opgg_flex_cache_best_effort(reason="command")
+        # Only refresh if explicitly requested
+        if refresh == "1":
+            await refresh_opgg_flex_cache_best_effort(reason="command")
+
         entries, week_start, now = await compute_weekly_flex_leaderboard_from_opgg_cache()
         msg = format_flex_leaderboard(entries, week_start, now)
 
@@ -3760,12 +3764,16 @@ class GeneralCog(commands.Cog):
         name="flex_leaderboard_session",
         description="show a temporary flex jeffbot leaderboard for the last session",
     )
-    async def flex_leaderboard_recent(self, interaction: discord.Interaction):
+    @app_commands.describe(refresh='Optional: "1" to refresh data first, blank or "0" to skip')
+    async def flex_leaderboard_recent(self, interaction: discord.Interaction, refresh: str | None = None):
         await interaction.response.defer()
 
         # Uses the OP.GG cache (auto-refreshed every 30 minutes) so we don't
         # depend on the DPM site being up and we can accumulate >20 matches over time.
-        await refresh_opgg_flex_cache_best_effort(reason="post_leaderboard")
+        # Only refresh if explicitly requested
+        if refresh == "1":
+            await refresh_opgg_flex_cache_best_effort(reason="post_leaderboard")
+
         entries, start_utc, end_utc = await compute_recent_flex_leaderboard_from_opgg_cache(hours=18)
         msg = format_recent_flex_leaderboard(entries, start_utc, end_utc)
         await interaction.followup.send(msg)
