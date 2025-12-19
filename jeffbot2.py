@@ -1109,7 +1109,7 @@ async def _fetch_opgg_flex_matches_from_url(context, opgg_url: str) -> list[dict
         cache_bust = int(time.time())
         sep = "&" if "?" in opgg_url else "?"
         url = f"{opgg_url}{sep}t={cache_bust}"
-        await page.goto(opgg_url, wait_until="domcontentloaded", timeout=60_000)
+        await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
 
         # Give the page time to kick off its RSC requests.
         # OP.GG can be slow / bursty; a slightly longer settle helps a lot.
@@ -1325,61 +1325,98 @@ def _iter_cached_matches(player_name: str) -> list[dict]:
 async def refresh_opgg_flex_cache_best_effort(reason: str = "manual") -> None:
     """
     Refresh cache by scraping the most recent Flex matches from each tracked OP.GG profile.
+
     Best-effort: failures for one profile won't fail the whole refresh.
+
+    Fixes:
+      - Uses `_opgg_refresh_lock` so concurrent slash calls don't race / stomp
+      - Only bumps `_OPGG_FLEX_CACHE_LAST_REFRESH_UTC` after an actual attempt
+      - Forces no-cache headers in the Playwright context
     """
     global _OPGG_FLEX_CACHE_LAST_REFRESH_UTC
 
-    # avoid refresh storms (e.g., multiple commands at once)
-    now_utc = datetime.now(timezone.utc)
-    if _OPGG_FLEX_CACHE_LAST_REFRESH_UTC and (now_utc - _OPGG_FLEX_CACHE_LAST_REFRESH_UTC).total_seconds() < 20:
-        return
+    async with _opgg_refresh_lock:
+        now_utc = datetime.now(timezone.utc)
 
-    _OPGG_FLEX_CACHE_LAST_REFRESH_UTC = now_utc
-    _load_opgg_flex_cache()
+        # avoid refresh storms (e.g., multiple commands at once)
+        if (
+            _OPGG_FLEX_CACHE_LAST_REFRESH_UTC
+            and (now_utc - _OPGG_FLEX_CACHE_LAST_REFRESH_UTC).total_seconds() < 20
+        ):
+            return
 
-    if not DPM_FLEX_PROFILES:
-        return
+        # Ensure cache is loaded in-memory
+        _load_opgg_flex_cache()
 
-    try:
-        from playwright.async_api import async_playwright
-    except Exception as e:
-        print(f"[OPGG][cache] Playwright not available: {type(e).__name__}: {e}")
-        return
-
-    print(f"[OPGG][cache] refresh start ({reason})")
-
-    async with async_playwright() as p:
-        # You asked for headless=False so you can watch it scrape.
-        browser = await p.chromium.launch(headless=False)
-        context = await browser.new_context(locale="en-US")
+        if not DPM_FLEX_PROFILES:
+            _OPGG_FLEX_CACHE_LAST_REFRESH_UTC = now_utc
+            return
 
         try:
-            names = list(DPM_FLEX_PROFILES.keys())
-            tasks = []
-            for name in names:
-                prof = DPM_FLEX_PROFILES.get(name) or {}
-                url = prof.get("opgg_url") if isinstance(prof, dict) else None
-                if not isinstance(url, str) or not url:
-                    print(f"[OPGG][cache] missing opgg_url for {name}")
-                    continue
-                tasks.append(_fetch_opgg_flex_matches_from_url(context, url))
+            from playwright.async_api import async_playwright
+        except Exception as e:
+            print(f"[OPGG][cache] Playwright not available: {type(e).__name__}: {e}")
+            _OPGG_FLEX_CACHE_LAST_REFRESH_UTC = now_utc
+            return
 
-            done = await asyncio.gather(*tasks, return_exceptions=True)
+        print(f"[OPGG][cache] refresh start ({reason})")
 
-            total_inserted = 0
-            # Note: tasks list may be shorter if a profile is missing a URL.
-            for name, res in zip([n for n in names if isinstance((DPM_FLEX_PROFILES.get(n) or {}).get("opgg_url"), str)], done):
-                if isinstance(res, Exception):
-                    print(f"[OPGG][cache] scrape failed for {name}: {type(res).__name__}: {res}")
-                    continue
-                inserted = _cache_upsert_matches(name, res or [])
-                total_inserted += inserted
+        total_inserted = 0
 
-            print(f"[OPGG][cache] refresh done ({reason}) inserted={total_inserted}")
+        try:
+            async with async_playwright() as p:
+                # You asked for headless=False so you can watch it scrape.
+                browser = await p.chromium.launch(headless=False)
+
+                # Aggressively discourage caching.
+                context = await browser.new_context(
+                    locale="en-US",
+                    extra_http_headers={
+                        "Cache-Control": "no-cache, no-store, must-revalidate",
+                        "Pragma": "no-cache",
+                        "Expires": "0",
+                    },
+                )
+
+                try:
+                    names = list(DPM_FLEX_PROFILES.keys())
+                    tasks = []
+                    task_names = []
+
+                    for name in names:
+                        prof = DPM_FLEX_PROFILES.get(name) or {}
+                        url = prof.get("opgg_url") if isinstance(prof, dict) else None
+                        if not isinstance(url, str) or not url:
+                            print(f"[OPGG][cache] missing opgg_url for {name}")
+                            continue
+                        task_names.append(name)
+                        tasks.append(_fetch_opgg_flex_matches_from_url(context, url))
+
+                    done = await asyncio.gather(*tasks, return_exceptions=True)
+
+                    for name, res in zip(task_names, done):
+                        if isinstance(res, Exception):
+                            print(f"[OPGG][cache] scrape failed for {name}: {type(res).__name__}: {res}")
+                            continue
+                        inserted = _cache_upsert_matches(name, res or [])
+                        total_inserted += inserted
+
+                    print(f"[OPGG][cache] refresh done ({reason}) inserted={total_inserted}")
+
+                finally:
+                    try:
+                        await context.close()
+                    except Exception:
+                        pass
+                    try:
+                        await browser.close()
+                    except Exception:
+                        pass
+
         finally:
-            await context.close()
-            await browser.close()
-
+            # Advance the timestamp after the attempt (even if inserted=0),
+            # so repeated /refresh 1 spam doesn't launch dozens of browsers.
+            _OPGG_FLEX_CACHE_LAST_REFRESH_UTC = datetime.now(timezone.utc)
 
 async def compute_recent_flex_leaderboard_from_opgg_cache(hours: int = 18) -> tuple[list[dict], datetime, datetime]:
     """Compute a temporary leaderboard from cached OP.GG matches in the last `hours`."""
@@ -2608,7 +2645,7 @@ def format_reply_chain_block(chain_msgs: list[discord.Message]) -> str:
 
 _ready_synced = False
 
-@tasks.loop(minutes=30)
+@tasks.loop(hours=1)
 async def opgg_cache_refresh_loop():
     if _opgg_refresh_lock.locked():
         return
