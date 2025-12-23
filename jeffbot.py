@@ -86,6 +86,10 @@ user_messages_collected = 0
 
 LOCAL_TIMEZONE = timezone(timedelta(hours=-4))
 
+# Track voice clients per guild
+voice_clients: dict[int, discord.VoiceClient] = {}
+
+
 
 # Dictionary to store user balances
 user_balances = {}
@@ -1003,7 +1007,7 @@ def format_recent_flex_leaderboard(entries: list[dict], start_utc: datetime, end
     games_w = max(len("Games"), max(len(g) for g in games_col))
 
     lines: list[str] = []
-    lines.append(f"**⏱️ LAST FLEX SESSION LEADERBOARD** ( {header_end})")
+    lines.append(f"**⏱️ LAST FLEX SESSION LEADERBOARD** ({header_end})")
     lines.append("```text")
 
     # Header
@@ -3499,6 +3503,77 @@ class GeneralCog(commands.Cog):
         
 
     
+    # ====== Voice controls: /join and /leave ======
+    @app_commands.command(name="join", description="Join a voice channel by channel ID")
+    @app_commands.describe(channel_id="Voice channel ID (numbers)")
+    async def join(self, interaction: discord.Interaction, channel_id: str):
+        # Must be used in a guild
+        if interaction.guild is None:
+            await interaction.response.send_message("This only works in a server.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        # Parse ID
+        if not channel_id.isdigit():
+            await interaction.followup.send("Channel ID must be numeric.", ephemeral=True)
+            return
+
+        cid = int(channel_id)
+
+        # Fetch channel
+        channel = interaction.guild.get_channel(cid)
+        if channel is None:
+            try:
+                channel = await interaction.guild.fetch_channel(cid)
+            except Exception as e:
+                await interaction.followup.send(f"Couldn't find that channel: {e}", ephemeral=True)
+                return
+
+        # Validate it's a voice channel (or stage)
+        if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+            await interaction.followup.send("That channel ID is not a voice/stage channel.", ephemeral=True)
+            return
+
+        # Permissions check (connect)
+        me = interaction.guild.me or interaction.guild.get_member(self.bot.user.id)
+        perms = channel.permissions_for(me)
+        if not perms.connect:
+            await interaction.followup.send("I don't have permission to CONNECT to that channel.", ephemeral=True)
+            return
+
+        # Connect / move
+        vc = interaction.guild.voice_client
+        try:
+            if vc and vc.is_connected():
+                if vc.channel.id != channel.id:
+                    await vc.move_to(channel)
+                await interaction.followup.send(f"✅ Connected to **{channel.name}**.", ephemeral=True)
+                return
+
+            await channel.connect(timeout=20, reconnect=True)
+            await interaction.followup.send(f"✅ Connected to **{channel.name}**.", ephemeral=True)
+
+        except Exception as e:
+            await interaction.followup.send(f"❌ Failed to join: `{e}`", ephemeral=True)
+
+    @app_commands.command(name="leave", description="Leave the current voice channel")
+    async def leave(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            await interaction.response.send_message("This only works in a server.", ephemeral=True)
+            return
+
+        vc = interaction.guild.voice_client
+        if not vc or not vc.is_connected():
+            await interaction.response.send_message("I'm not connected to any voice channel.", ephemeral=True)
+            return
+
+        try:
+            await vc.disconnect(force=True)
+            await interaction.response.send_message("👋 Left the voice channel.", ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Failed to leave: `{e}`", ephemeral=True)
+
 
 
 
