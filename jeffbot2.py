@@ -86,6 +86,10 @@ user_messages_collected = 0
 
 LOCAL_TIMEZONE = timezone(timedelta(hours=-4))
 
+# Track voice clients per guild
+voice_clients: dict[int, discord.VoiceClient] = {}
+
+
 
 # Dictionary to store user balances
 user_balances = {}
@@ -990,30 +994,36 @@ def format_recent_flex_leaderboard(entries: list[dict], start_utc: datetime, end
     rank_col = [str(i) for i in range(1, len(entries) + 1)]
     name_col = [e["name"] for e in entries]
     score_col = [f"{e['avg']:.2f}" for e in entries]
+    kda_col = ["--" if e.get("avg_kda") is None else f"{float(e['avg_kda']):.2f}" for e in entries]
+    lane_col = ["--" if e.get("avg_lane") is None else f"{float(e['avg_lane']):.2f}" for e in entries]
     games_col = [str(e["games"]) for e in entries]
 
     # Column widths
     rank_w = max(len("RK"), max(len(r) for r in rank_col))
     name_w = max(len("Player"), max(len(n) for n in name_col))
     score_w = max(len("Score"), max(len(s) for s in score_col))
+    kda_w = max(len("KDA"), max(len(s) for s in kda_col))
+    lane_w = max(len("Lane"), max(len(s) for s in lane_col))
     games_w = max(len("Games"), max(len(g) for g in games_col))
 
     lines: list[str] = []
-    lines.append(f"**⏱️ LAST FLEX SESSION LEADERBOARD** ( {header_end})")
+    lines.append(f"**⏱️ LAST FLEX SESSION LEADERBOARD** ({header_end})")
     lines.append("```text")
 
     # Header
     header = (
         f"{'RK'.rjust(rank_w)}  "
-        f"{'Player'.ljust(name_w)}  "
-        f"{'Score'.rjust(score_w)}  "
-        f"{'Games'.rjust(games_w)}"
+        f"{'Player'.ljust(name_w)}   "
+        f"{'Score'.rjust(score_w)} "
+        f"{'KDA'.rjust(kda_w)}  "
+        f"{'Lane'.rjust(lane_w)}    "
+        f"{'Games'.rjust(games_w)}  "
     )
     lines.append(header)
-    lines.append("-" * len(header))
+    lines.append("-" * (len(header) + 1))
 
     # Rows (with medal swap for 1/2/3, same trick as your weekly)
-    for idx, (r, n, s, g) in enumerate(zip(rank_col, name_col, score_col, games_col), start=1):
+    for idx, (r, n, s, k, l, g) in enumerate(zip(rank_col, name_col, score_col, kda_col, lane_col, games_col), start=1):
         # Replace ranks 1,2,3 with medal emoji (no padding)
         if idx == 1:
             rk_field = "🥇"
@@ -1028,6 +1038,8 @@ def format_recent_flex_leaderboard(entries: list[dict], start_utc: datetime, end
             f"{rk_field}  "
             f"{n.ljust(name_w)}  "
             f"{s.rjust(score_w)}  "
+            f"{k.rjust(kda_w)}  "
+            f"{l.rjust(lane_w)}  "
             f"{g.rjust(games_w)}"
         )
         lines.append(line)
@@ -1067,9 +1079,67 @@ def _find_me_in_opgg_match(match: dict) -> dict | None:
     return None
 
 
+def _opgg_try_float(v) -> float | None:
+    """Best-effort: coerce OP.GG stat values into a float."""
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+        # common formats: "3.25", "3.25:1", "3.25%" (we strip non-numeric suffixes)
+        # Keep leading sign, digits, dot.
+        m = re.match(r"^\s*([+-]?[0-9]*\.?[0-9]+)", s)
+        if not m:
+            return None
+        try:
+            return float(m.group(1))
+        except Exception:
+            return None
+    return None
+
+
+def _opgg_get_stat_float(stats: dict, keys: list[str]) -> float | None:
+    """Try multiple keys and return the first parseable float."""
+    if not isinstance(stats, dict):
+        return None
+    for k in keys:
+        if k in stats:
+            v = _opgg_try_float(stats.get(k))
+            if v is not None:
+                return v
+    return None
+
+
+def _opgg_compute_kda_ratio_from_stats(stats: dict) -> float | None:
+    """Fallback KDA ratio from kills/deaths/assists if OP.GG doesn't provide kda_ratio."""
+    if not isinstance(stats, dict):
+        return None
+
+    # OP.GG uses singular keys: kill/death/assist (keep plural fallbacks too)
+    kills = _opgg_try_float(stats.get("kills") if stats.get("kills") is not None else stats.get("kill"))
+    deaths = _opgg_try_float(stats.get("deaths") if stats.get("deaths") is not None else stats.get("death"))
+    assists = _opgg_try_float(stats.get("assists") if stats.get("assists") is not None else stats.get("assist"))
+
+    if kills is None or deaths is None or assists is None:
+        return None
+
+    return (kills + assists) / max(1.0, deaths)
+
+
+
+
+
+
 async def _fetch_opgg_flex_matches_from_url(context, opgg_url: str) -> list[dict]:
     """
-    Returns: [{ "match_id": str, "created_at": datetime|None, "op_score": float|None }, ...]
+    Returns: [{
+        "match_id": str,
+        "created_at": datetime|None,
+        "op_score": float|None,
+        "kda_ratio": float|None,
+        "laning_score": float|None,
+    }, ...]
     Grabs the first *large* RSC payload and returns immediately (no long scroll loops).
     """
     page = await context.new_page()
@@ -1109,7 +1179,7 @@ async def _fetch_opgg_flex_matches_from_url(context, opgg_url: str) -> list[dict
         cache_bust = int(time.time())
         sep = "&" if "?" in opgg_url else "?"
         url = f"{opgg_url}{sep}t={cache_bust}"
-        await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        await page.goto(opgg_url, wait_until="domcontentloaded", timeout=60_000)
 
         # Give the page time to kick off its RSC requests.
         # OP.GG can be slow / bursty; a slightly longer settle helps a lot.
@@ -1172,14 +1242,53 @@ async def _fetch_opgg_flex_matches_from_url(context, opgg_url: str) -> list[dict
 
         me = _find_me_in_opgg_match(m)
         op_score = None
+        kda_ratio = None
+        laning_score = None
         if isinstance(me, dict):
             stats = me.get("stats")
-            if isinstance(stats, dict):
-                v = stats.get("op_score")
-                if isinstance(v, (int, float)):
-                    op_score = float(v)
+            #if isinstance(stats, dict):
+            #    print(
+            #        "[OPGG] sample K/D/A:",
+            #        stats.get("kill"), stats.get("death"), stats.get("assist"),
+            #        "(plural fallback):",
+            #        stats.get("kills"), stats.get("deaths"), stats.get("assists")
+            #    )
 
-        out.append({"match_id": match_id, "created_at": created_dt, "op_score": op_score})
+
+            if isinstance(stats, dict):
+                op_score = _opgg_get_stat_float(stats, ["op_score", "opScore", "opscore"])
+
+                # OP.GG sometimes uses slightly different keys; try a few.
+                kda_ratio = _opgg_get_stat_float(stats, ["kda_ratio", "kdaRatio", "kda"])
+
+                # OP.GG does not provide KDA for flex → compute it ourselves
+                if kda_ratio is None:
+                    kda_ratio = _opgg_compute_kda_ratio_from_stats(stats)
+
+                # "laning" / "lane" score is exposed alongside op_score in the same stats dict.
+                laning_score = _opgg_get_stat_float(
+                    stats,
+                    [
+                        "laning_phase_score",
+                        "laningPhaseScore",
+                        "laning_score",
+                        "laningScore",
+                        "lane_score",
+                        "laneScore",
+                        "lane_phase_score",
+                        "lanePhaseScore",
+                    ],
+                )
+
+        out.append(
+            {
+                "match_id": match_id,
+                "created_at": created_dt,
+                "op_score": op_score,
+                "kda_ratio": kda_ratio,
+                "laning_score": laning_score,
+            }
+        )
 
     return out
 
@@ -1275,15 +1384,24 @@ def _cache_upsert_matches(player_name: str, matches: list[dict]) -> int:
             continue
 
         if match_id in player_bucket:
-            # already have it
+            # Already have it — but backfill any missing fields (older cache versions had only op_score).
+            existing = player_bucket.get(match_id)
+            if isinstance(existing, dict):
+                # Prefer new values when the existing entry is missing them (None / key absent).
+                if existing.get("created_at") in (None, "") and m.get("created_at") is not None:
+                    existing["created_at"] = m.get("created_at")
+                if existing.get("op_score") is None and m.get("op_score") is not None:
+                    existing["op_score"] = m.get("op_score")
+                if existing.get("kda_ratio") is None and m.get("kda_ratio") is not None:
+                    existing["kda_ratio"] = m.get("kda_ratio")
+                if existing.get("laning_score") is None and m.get("laning_score") is not None:
+                    existing["laning_score"] = m.get("laning_score")
             continue
 
         created = m.get("created_at")
         created_iso = None
         if isinstance(created, datetime):
-            # store as ISO string (UTC)
-            created_utc = _coerce_dt_to_utc(created)
-            created_iso = created_utc.isoformat()
+            created_iso = created.isoformat()
         elif isinstance(created, str):
             created_iso = created
 
@@ -1291,6 +1409,9 @@ def _cache_upsert_matches(player_name: str, matches: list[dict]) -> int:
             "match_id": match_id,
             "created_at": created_iso,
             "op_score": m.get("op_score"),
+            # New: used for extra leaderboard columns.
+            "kda_ratio": m.get("kda_ratio"),
+            "laning_score": m.get("laning_score"),
         }
         inserted += 1
 
@@ -1317,6 +1438,8 @@ def _iter_cached_matches(player_name: str) -> list[dict]:
                 "match_id": payload.get("match_id") or match_id,
                 "created_at": created_dt,
                 "op_score": payload.get("op_score"),
+                "kda_ratio": payload.get("kda_ratio"),
+                "laning_score": payload.get("laning_score"),
             }
         )
     return out
@@ -1325,98 +1448,61 @@ def _iter_cached_matches(player_name: str) -> list[dict]:
 async def refresh_opgg_flex_cache_best_effort(reason: str = "manual") -> None:
     """
     Refresh cache by scraping the most recent Flex matches from each tracked OP.GG profile.
-
     Best-effort: failures for one profile won't fail the whole refresh.
-
-    Fixes:
-      - Uses `_opgg_refresh_lock` so concurrent slash calls don't race / stomp
-      - Only bumps `_OPGG_FLEX_CACHE_LAST_REFRESH_UTC` after an actual attempt
-      - Forces no-cache headers in the Playwright context
     """
     global _OPGG_FLEX_CACHE_LAST_REFRESH_UTC
 
-    async with _opgg_refresh_lock:
-        now_utc = datetime.now(timezone.utc)
+    # avoid refresh storms (e.g., multiple commands at once)
+    now_utc = datetime.now(timezone.utc)
+    if _OPGG_FLEX_CACHE_LAST_REFRESH_UTC and (now_utc - _OPGG_FLEX_CACHE_LAST_REFRESH_UTC).total_seconds() < 20:
+        return
 
-        # avoid refresh storms (e.g., multiple commands at once)
-        if (
-            _OPGG_FLEX_CACHE_LAST_REFRESH_UTC
-            and (now_utc - _OPGG_FLEX_CACHE_LAST_REFRESH_UTC).total_seconds() < 20
-        ):
-            return
+    _OPGG_FLEX_CACHE_LAST_REFRESH_UTC = now_utc
+    _load_opgg_flex_cache()
 
-        # Ensure cache is loaded in-memory
-        _load_opgg_flex_cache()
+    if not DPM_FLEX_PROFILES:
+        return
 
-        if not DPM_FLEX_PROFILES:
-            _OPGG_FLEX_CACHE_LAST_REFRESH_UTC = now_utc
-            return
+    try:
+        from playwright.async_api import async_playwright
+    except Exception as e:
+        print(f"[OPGG][cache] Playwright not available: {type(e).__name__}: {e}")
+        return
 
-        try:
-            from playwright.async_api import async_playwright
-        except Exception as e:
-            print(f"[OPGG][cache] Playwright not available: {type(e).__name__}: {e}")
-            _OPGG_FLEX_CACHE_LAST_REFRESH_UTC = now_utc
-            return
+    print(f"[OPGG][cache] refresh start ({reason})")
 
-        print(f"[OPGG][cache] refresh start ({reason})")
-
-        total_inserted = 0
+    async with async_playwright() as p:
+        # You asked for headless=False so you can watch it scrape.
+        browser = await p.chromium.launch(headless=False)
+        context = await browser.new_context(locale="en-US")
 
         try:
-            async with async_playwright() as p:
-                # You asked for headless=False so you can watch it scrape.
-                browser = await p.chromium.launch(headless=False)
+            names = list(DPM_FLEX_PROFILES.keys())
+            tasks = []
+            for name in names:
+                prof = DPM_FLEX_PROFILES.get(name) or {}
+                url = prof.get("opgg_url") if isinstance(prof, dict) else None
+                if not isinstance(url, str) or not url:
+                    print(f"[OPGG][cache] missing opgg_url for {name}")
+                    continue
+                tasks.append(_fetch_opgg_flex_matches_from_url(context, url))
 
-                # Aggressively discourage caching.
-                context = await browser.new_context(
-                    locale="en-US",
-                    extra_http_headers={
-                        "Cache-Control": "no-cache, no-store, must-revalidate",
-                        "Pragma": "no-cache",
-                        "Expires": "0",
-                    },
-                )
+            done = await asyncio.gather(*tasks, return_exceptions=True)
 
-                try:
-                    names = list(DPM_FLEX_PROFILES.keys())
-                    tasks = []
-                    task_names = []
+            total_inserted = 0
+            # Note: tasks list may be shorter if a profile is missing a URL.
+            for name, res in zip([n for n in names if isinstance((DPM_FLEX_PROFILES.get(n) or {}).get("opgg_url"), str)], done):
+                if isinstance(res, Exception):
+                    print(f"[OPGG][cache] scrape failed for {name}: {type(res).__name__}: {res}")
+                    continue
+                inserted = _cache_upsert_matches(name, res or [])
+                total_inserted += inserted
 
-                    for name in names:
-                        prof = DPM_FLEX_PROFILES.get(name) or {}
-                        url = prof.get("opgg_url") if isinstance(prof, dict) else None
-                        if not isinstance(url, str) or not url:
-                            print(f"[OPGG][cache] missing opgg_url for {name}")
-                            continue
-                        task_names.append(name)
-                        tasks.append(_fetch_opgg_flex_matches_from_url(context, url))
-
-                    done = await asyncio.gather(*tasks, return_exceptions=True)
-
-                    for name, res in zip(task_names, done):
-                        if isinstance(res, Exception):
-                            print(f"[OPGG][cache] scrape failed for {name}: {type(res).__name__}: {res}")
-                            continue
-                        inserted = _cache_upsert_matches(name, res or [])
-                        total_inserted += inserted
-
-                    print(f"[OPGG][cache] refresh done ({reason}) inserted={total_inserted}")
-
-                finally:
-                    try:
-                        await context.close()
-                    except Exception:
-                        pass
-                    try:
-                        await browser.close()
-                    except Exception:
-                        pass
-
+            print(f"[OPGG][cache] refresh done ({reason}) inserted={total_inserted}")
         finally:
-            # Advance the timestamp after the attempt (even if inserted=0),
-            # so repeated /refresh 1 spam doesn't launch dozens of browsers.
-            _OPGG_FLEX_CACHE_LAST_REFRESH_UTC = datetime.now(timezone.utc)
+            await context.close()
+            await browser.close()
+
 
 async def compute_recent_flex_leaderboard_from_opgg_cache(hours: int = 18) -> tuple[list[dict], datetime, datetime]:
     """Compute a temporary leaderboard from cached OP.GG matches in the last `hours`."""
@@ -1444,6 +1530,8 @@ async def compute_recent_flex_leaderboard_from_opgg_cache(hours: int = 18) -> tu
     entries: list[dict] = []
     for name in DPM_FLEX_PROFILES.keys():
         scores: list[float] = []
+        kdas: list[float] = []
+        lanes: list[float] = []
         for m in per_player_matches.get(name, []) or []:
             match_id = m.get("match_id")
             if not match_id:
@@ -1464,8 +1552,24 @@ async def compute_recent_flex_leaderboard_from_opgg_cache(hours: int = 18) -> tu
             if isinstance(op_score, (int, float)):
                 scores.append(float(op_score))
 
+            kda_ratio = m.get("kda_ratio")
+            if isinstance(kda_ratio, (int, float)):
+                kdas.append(float(kda_ratio))
+
+            laning_score = m.get("laning_score")
+            if isinstance(laning_score, (int, float)):
+                lanes.append(float(laning_score))
+
         if scores:
-            entries.append({"name": name, "games": len(scores), "avg": sum(scores) / len(scores)})
+            entries.append(
+                {
+                    "name": name,
+                    "games": len(scores),
+                    "avg": sum(scores) / len(scores),
+                    "avg_kda": (sum(kdas) / len(kdas)) if kdas else None,
+                    "avg_lane": (sum(lanes) / len(lanes)) if lanes else None,
+                }
+            )
 
     entries.sort(key=lambda e: e["avg"], reverse=True)
     return entries, start_utc, now_utc
@@ -1506,6 +1610,8 @@ async def compute_weekly_flex_leaderboard_from_opgg_cache(days: int = 7) -> tupl
     entries: list[dict] = []
     for name in DPM_FLEX_PROFILES.keys():
         scores: list[float] = []
+        kdas: list[float] = []
+        lanes: list[float] = []
         for m in per_player_matches.get(name, []) or []:
             match_id = m.get("match_id")
             if not match_id:
@@ -1526,10 +1632,26 @@ async def compute_weekly_flex_leaderboard_from_opgg_cache(days: int = 7) -> tupl
             if isinstance(op_score, (int, float)):
                 scores.append(float(op_score))
 
+            kda_ratio = m.get("kda_ratio")
+            if isinstance(kda_ratio, (int, float)):
+                kdas.append(float(kda_ratio))
+
+            laning_score = m.get("laning_score")
+            if isinstance(laning_score, (int, float)):
+                lanes.append(float(laning_score))
+
         # Keep weekly minimums for your "real" weekly command;
         # for testing you can temporarily set MIN_FLEX_GAMES_PER_WEEK=0 if you want.
         if len(scores) >= MIN_FLEX_GAMES_PER_WEEK:
-            entries.append({"name": name, "games": len(scores), "avg": sum(scores) / len(scores)})
+            entries.append(
+                {
+                    "name": name,
+                    "games": len(scores),
+                    "avg": sum(scores) / len(scores),
+                    "avg_kda": (sum(kdas) / len(kdas)) if kdas else None,
+                    "avg_lane": (sum(lanes) / len(lanes)) if lanes else None,
+                }
+            )
 
     entries.sort(key=lambda e: e["avg"], reverse=True)
 
@@ -1699,13 +1821,15 @@ def format_flex_leaderboard(entries: list[dict], display_start, display_end) -> 
     rank_col = [str(i) for i in range(1, len(entries) + 1)]
     name_col = [e["name"] for e in entries]
     score_col = [f"{e['avg']:.2f}" for e in entries]
+    kda_col = ["--" if e.get("avg_kda") is None else f"{float(e['avg_kda']):.2f}" for e in entries]
+    lane_col = ["--" if e.get("avg_lane") is None else f"{float(e['avg_lane']):.2f}" for e in entries]
     games_col = [str(e["games"]) for e in entries]
 
     change_col = []
     for e in entries:
         delta = e.get("delta")
         if delta is None:
-            change_col.append("NEW")
+            change_col.append("--")
         elif delta == 0:
             change_col.append("-")
         elif delta > 0:
@@ -1717,6 +1841,8 @@ def format_flex_leaderboard(entries: list[dict], display_start, display_end) -> 
     rank_w = max(len("RK"), max(len(r) for r in rank_col))
     name_w = max(len("Player"), max(len(n) for n in name_col))
     score_w = max(len("Score"), max(len(s) for s in score_col))
+    kda_w = max(len("KDA"), max(len(s) for s in kda_col))
+    lane_w = max(len("Lane"), max(len(s) for s in lane_col))
     games_w = max(len("Games"), max(len(g) for g in games_col))
     change_w = max(len("Change"), max(len(c) for c in change_col))
 
@@ -1726,16 +1852,18 @@ def format_flex_leaderboard(entries: list[dict], display_start, display_end) -> 
     # Header
     header = (
         f"{'RK'.rjust(rank_w)}  "
-        f"{'Player'.ljust(name_w)}  "
-        f"{'Score'.rjust(score_w)}  "
+        f"{'Player'.ljust(name_w)}   "
+        f"{'Score'.rjust(score_w)} "
+        f"{'KDA'.rjust(kda_w)}  "
+        f"{'Lane'.rjust(lane_w)}    "
         f"{'Games'.rjust(games_w)}  "
         f"{'Change'.rjust(change_w)}"
     )
     lines.append(header)
-    lines.append("-" * len(header))
+    lines.append("-" * (len(header) + 1))
 
     # Rows
-    for idx, (r, n, s, g, c) in enumerate(zip(rank_col, name_col, score_col, games_col, change_col), start=1):
+    for idx, (r, n, s, k, l, g, c) in enumerate(zip(rank_col, name_col, score_col, kda_col, lane_col, games_col, change_col), start=1):
 
         # --- Replace ranks 1,2,3 with medal emoji (no padding!) ---
         if idx == 1:
@@ -1757,6 +1885,8 @@ def format_flex_leaderboard(entries: list[dict], display_start, display_end) -> 
             f"{rk_field}  "
             f"{n.ljust(name_w)}  "
             f"{s.rjust(score_w)}  "
+            f"{k.rjust(kda_w)}  "
+            f"{l.rjust(lane_w)}  "
             f"{g.rjust(games_w)}  "
             f"{c.rjust(change_w)}"
         )
@@ -2645,7 +2775,7 @@ def format_reply_chain_block(chain_msgs: list[discord.Message]) -> str:
 
 _ready_synced = False
 
-@tasks.loop(hours=1)
+@tasks.loop(minutes=30)
 async def opgg_cache_refresh_loop():
     if _opgg_refresh_lock.locked():
         return
@@ -3373,6 +3503,77 @@ class GeneralCog(commands.Cog):
         
 
     
+    # ====== Voice controls: /join and /leave ======
+    @app_commands.command(name="join", description="Join a voice channel by channel ID")
+    @app_commands.describe(channel_id="Voice channel ID (numbers)")
+    async def join(self, interaction: discord.Interaction, channel_id: str):
+        # Must be used in a guild
+        if interaction.guild is None:
+            await interaction.response.send_message("This only works in a server.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        # Parse ID
+        if not channel_id.isdigit():
+            await interaction.followup.send("Channel ID must be numeric.", ephemeral=True)
+            return
+
+        cid = int(channel_id)
+
+        # Fetch channel
+        channel = interaction.guild.get_channel(cid)
+        if channel is None:
+            try:
+                channel = await interaction.guild.fetch_channel(cid)
+            except Exception as e:
+                await interaction.followup.send(f"Couldn't find that channel: {e}", ephemeral=True)
+                return
+
+        # Validate it's a voice channel (or stage)
+        if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+            await interaction.followup.send("That channel ID is not a voice/stage channel.", ephemeral=True)
+            return
+
+        # Permissions check (connect)
+        me = interaction.guild.me or interaction.guild.get_member(self.bot.user.id)
+        perms = channel.permissions_for(me)
+        if not perms.connect:
+            await interaction.followup.send("I don't have permission to CONNECT to that channel.", ephemeral=True)
+            return
+
+        # Connect / move
+        vc = interaction.guild.voice_client
+        try:
+            if vc and vc.is_connected():
+                if vc.channel.id != channel.id:
+                    await vc.move_to(channel)
+                await interaction.followup.send(f"✅ Connected to **{channel.name}**.", ephemeral=True)
+                return
+
+            await channel.connect(timeout=20, reconnect=True)
+            await interaction.followup.send(f"✅ Connected to **{channel.name}**.", ephemeral=True)
+
+        except Exception as e:
+            await interaction.followup.send(f"❌ Failed to join: `{e}`", ephemeral=True)
+
+    @app_commands.command(name="leave", description="Leave the current voice channel")
+    async def leave(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            await interaction.response.send_message("This only works in a server.", ephemeral=True)
+            return
+
+        vc = interaction.guild.voice_client
+        if not vc or not vc.is_connected():
+            await interaction.response.send_message("I'm not connected to any voice channel.", ephemeral=True)
+            return
+
+        try:
+            await vc.disconnect(force=True)
+            await interaction.response.send_message("👋 Left the voice channel.", ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Failed to leave: `{e}`", ephemeral=True)
+
 
 
 
