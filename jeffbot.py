@@ -61,6 +61,9 @@ BALANCES_FILE = os.path.join(SCRIPT_DIR, 'user_balances.json')
 DAILY_COOLDOWN_FILE = os.path.join(SCRIPT_DIR, 'daily_cooldowns.json')
 FLEX_RANK_SNAPSHOTS_FILE = os.path.join(SCRIPT_DIR, "flex_rank_snapshots.json")
 
+# Persistent Flex leaderboard message pointers (so the bot can edit 1 message instead of spamming new ones)
+FLEX_PERSISTENT_MESSAGES_FILE = os.path.join(SCRIPT_DIR, "flex_persistent_messages.json")
+
 
 
 USE_SUMMARY_FOR_CONTEXT = False
@@ -655,19 +658,15 @@ async def record_lenny_if_needed(message: discord.Message):
     # Only count target user
     if message.author.id != LENNY_TARGET_USER_ID:
         return
-
     # Optional: only count in one channel
     if LENNY_CHANNEL_ID and message.channel.id != LENNY_CHANNEL_ID:
         return
-
     content = message.content or ""
     if not content:
         return
-
     hits = len(_LENNY_RE.findall(content))
     if hits <= 0:
         return
-
     day = _detroit_day_str(message.created_at)
 
     async with _lenny_lock:
@@ -1155,11 +1154,9 @@ async def _fetch_opgg_flex_matches_from_url(context, opgg_url: str) -> list[dict
             ctype = (resp.headers.get("content-type") or "").lower()
             if "text/x-component" not in ctype:
                 return
-
             body = await resp.text()
             if not body:
                 return
-
             # Your log spam is fine; keep it if you want:
             print(f"[OPGG] RSC resp {resp.status} size={len(body)} url={resp.url}")
 
@@ -1325,6 +1322,254 @@ def _get_detroit_tz():
 
 DETROIT_TZ = _get_detroit_tz()
 
+# =========================
+# Persistent Flex leaderboard messages (1 message per guild, edited in-place)
+# =========================
+
+_FLEX_PERSISTENT_STATE: dict | None = None
+
+
+def _load_flex_persistent_state() -> dict:
+    """Load persistent message pointers from disk (best effort)."""
+    global _FLEX_PERSISTENT_STATE
+    if _FLEX_PERSISTENT_STATE is not None:
+        return _FLEX_PERSISTENT_STATE
+
+    base = {"weekly": {}, "session": {}}
+    try:
+        if os.path.exists(FLEX_PERSISTENT_MESSAGES_FILE):
+            with open(FLEX_PERSISTENT_MESSAGES_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f) or {}
+            if isinstance(raw.get("weekly"), dict):
+                base["weekly"] = raw.get("weekly")
+            if isinstance(raw.get("session"), dict):
+                base["session"] = raw.get("session")
+    except Exception as e:
+        print(f"[FlexPersist] failed to load: {type(e).__name__}: {e}")
+
+    _FLEX_PERSISTENT_STATE = base
+    return _FLEX_PERSISTENT_STATE
+
+
+def _save_flex_persistent_state(state: dict) -> None:
+    """Persist persistent message pointers to disk (best effort)."""
+    global _FLEX_PERSISTENT_STATE
+    _FLEX_PERSISTENT_STATE = state
+    try:
+        tmp_path = FLEX_PERSISTENT_MESSAGES_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, FLEX_PERSISTENT_MESSAGES_FILE)
+    except Exception as e:
+        print(f"[FlexPersist] failed to save: {type(e).__name__}: {e}")
+
+
+def _format_last_updated_header(now_utc: datetime) -> str:
+    now_detroit = now_utc.astimezone(DETROIT_TZ)
+    return f"**Last updated:** {now_detroit.strftime('%m-%d %I:%M %p')}"
+
+
+def _get_persistent_pointer(kind: str, guild_id: int) -> dict | None:
+    state = _load_flex_persistent_state()
+    bucket = state.get(kind) or {}
+    ptr = bucket.get(str(guild_id))
+    return ptr if isinstance(ptr, dict) else None
+
+
+def _set_persistent_pointer(kind: str, guild_id: int, *, channel_id: int, message_id: int) -> None:
+    state = _load_flex_persistent_state()
+    bucket = state.setdefault(kind, {})
+    bucket[str(guild_id)] = {"channel_id": int(channel_id), "message_id": int(message_id)}
+    _save_flex_persistent_state(state)
+
+
+def _delete_persistent_pointer(kind: str, guild_id: int) -> None:
+    state = _load_flex_persistent_state()
+    bucket = state.get(kind) or {}
+    bucket.pop(str(guild_id), None)
+    _save_flex_persistent_state(state)
+
+
+async def _upsert_persistent_message(
+    *,
+    bot: commands.Bot,
+    kind: str,
+    guild_id: int,
+    channel_id: int,
+    content: str,
+) -> None:
+    """Create or edit the persistent message for (kind, guild_id)."""
+    try:
+        channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+    except Exception:
+        return
+
+    if channel is None:
+        return
+
+    ptr = _get_persistent_pointer(kind, guild_id)
+    msg_obj: discord.Message | None = None
+
+    if ptr:
+        try:
+            msg_obj = await channel.fetch_message(int(ptr.get("message_id")))
+        except Exception:
+            msg_obj = None
+
+    if msg_obj is None:
+        try:
+            msg_obj = await channel.send(content)
+            _set_persistent_pointer(kind, guild_id, channel_id=channel_id, message_id=msg_obj.id)
+            return
+        except Exception:
+            return
+
+    # Only edit if content actually changed (reduces rate-limit pressure)
+    try:
+        if (msg_obj.content or "") != (content or ""):
+            await msg_obj.edit(content=content)
+    except Exception:
+        # If we can't prove the message is editable anymore, forget the pointer so the next call can recreate.
+        _delete_persistent_pointer(kind, guild_id)
+
+def _latest_qualifying_flex_match_info_from_cache() -> tuple[str | None, datetime | None]:
+    """
+    Returns (match_id, created_at_utc) for the most recent qualifying flex match in the cache.
+    Qualifying = match_id appears for >=5 tracked members.
+    """
+    counts: dict[str, int] = {}
+    created_at_by_id: dict[str, datetime] = {}
+
+    for name in DPM_FLEX_PROFILES.keys():
+        for m in _iter_cached_matches(name) or []:
+            mid = m.get("match_id")
+            if not mid:
+                continue
+            counts[mid] = counts.get(mid, 0) + 1
+
+            created = m.get("created_at")
+            if isinstance(created, datetime):
+                created_utc = _coerce_dt_to_utc(created)
+                prev = created_at_by_id.get(mid)
+                if prev is None or created_utc > prev:
+                    created_at_by_id[mid] = created_utc
+
+    # most recent match_id among those with >=5 appearances
+    best_id = None
+    best_t = None
+    for mid, c in counts.items():
+        if c < 5:
+            continue
+        t = created_at_by_id.get(mid)
+        if t is None:
+            continue
+        if best_t is None or t > best_t:
+            best_t = t
+            best_id = mid
+
+    return best_id, best_t
+
+
+def _format_match_time_et(dt_utc: datetime | None) -> str:
+    if not isinstance(dt_utc, datetime):
+        return "Unknown time"
+    dt_et = dt_utc.astimezone(DETROIT_TZ)
+    # No year, human-friendly:
+    return dt_et.strftime("%m-%d %I:%M %p").lstrip("0").replace(" 0", " ")
+
+
+def _latest_qualifying_flex_match_id_from_cache(min_group_size: int = 5) -> str | None:
+    """Return the newest match_id that appears in the cache for >= min_group_size tracked members."""
+    tracked = list(DPM_FLEX_PROFILES.keys())
+    if not tracked:
+        return None
+
+    # match_id -> {"count": int, "best_created_at": datetime|None}
+    agg: dict[str, dict] = {}
+
+    for name in tracked:
+        for m in (_iter_cached_matches(name) or []):
+            mid = m.get("match_id")
+            if not mid:
+                continue
+            created = m.get("created_at")
+            created_utc = _coerce_dt_to_utc(created) if isinstance(created, datetime) else None
+
+            bucket = agg.get(mid)
+            if bucket is None:
+                agg[mid] = {"count": 1, "best_created_at": created_utc}
+            else:
+                bucket["count"] = int(bucket.get("count", 0)) + 1
+                bt = bucket.get("best_created_at")
+                if bt is None or (created_utc is not None and created_utc > bt):
+                    bucket["best_created_at"] = created_utc
+
+    best_mid = None
+    best_t = None
+    for mid, info in agg.items():
+        if int(info.get("count", 0)) < int(min_group_size):
+            continue
+        t = info.get("best_created_at")
+        if best_t is None or (t is not None and t > best_t):
+            best_t = t
+            best_mid = mid
+
+    return best_mid
+
+
+async def _update_all_persistent_flex_messages(bot: commands.Bot, *, reason: str = "refresh") -> None:
+    """If persistent messages exist, update them to latest computed leaderboards."""
+    state = _load_flex_persistent_state()
+    now_utc = datetime.now(timezone.utc)
+    header = _format_last_updated_header(now_utc)
+
+    # Weekly
+    for guild_id_str, ptr in (state.get("weekly") or {}).items():
+        if not isinstance(ptr, dict):
+            continue
+        try:
+            guild_id = int(guild_id_str)
+            channel_id = int(ptr.get("channel_id"))
+        except Exception:
+            continue
+
+        try:
+            entries, week_start, now = await compute_weekly_flex_leaderboard_from_opgg_cache()
+            body = format_flex_leaderboard(entries, week_start, now)
+            await _upsert_persistent_message(
+                bot=bot,
+                kind="weekly",
+                guild_id=guild_id,
+                channel_id=channel_id,
+                content=header + "\n" + body,
+            )
+        except Exception as e:
+            print(f"[FlexPersist] weekly update failed ({reason}): {type(e).__name__}: {e}")
+
+    # Session (18h)
+    for guild_id_str, ptr in (state.get("session") or {}).items():
+        if not isinstance(ptr, dict):
+            continue
+        try:
+            guild_id = int(guild_id_str)
+            channel_id = int(ptr.get("channel_id"))
+        except Exception:
+            continue
+
+        try:
+            entries, start_utc, end_utc = await compute_recent_flex_leaderboard_from_opgg_cache(hours=18)
+            body = format_recent_flex_leaderboard(entries, start_utc, end_utc)
+            await _upsert_persistent_message(
+                bot=bot,
+                kind="session",
+                guild_id=guild_id,
+                channel_id=channel_id,
+                content=header + "\n" + body,
+            )
+        except Exception as e:
+            print(f"[FlexPersist] session update failed ({reason}): {type(e).__name__}: {e}")
+
+
 def _coerce_dt_to_utc(dt: datetime) -> datetime:
     """Return an aware UTC datetime.
 
@@ -1445,63 +1690,95 @@ def _iter_cached_matches(player_name: str) -> list[dict]:
     return out
 
 
-async def refresh_opgg_flex_cache_best_effort(reason: str = "manual") -> None:
+async def refresh_opgg_flex_cache_best_effort(reason: str = "manual", *, force: bool = False) -> dict:
     """
-    Refresh cache by scraping the most recent Flex matches from each tracked OP.GG profile.
-    Best-effort: failures for one profile won't fail the whole refresh.
+    Refresh the local OP.GG flex cache by scraping the most recent FLEXRANKED matches
+    for each tracked profile prove.
+
+    Best-effort: a failure for one profile won't fail the whole refresh.
+
+    Args:
+        reason: log tag
+        force: if True, bypass the 20s anti-storm throttle and wait for the refresh lock
+               (instead of bailing) so repeated refresh attempts can be run in sequence.
+
+    Returns:
+        {"total_inserted": int, "inserted_by_name": {name: int}}
     """
     global _OPGG_FLEX_CACHE_LAST_REFRESH_UTC
 
-    # avoid refresh storms (e.g., multiple commands at once)
     now_utc = datetime.now(timezone.utc)
-    if _OPGG_FLEX_CACHE_LAST_REFRESH_UTC and (now_utc - _OPGG_FLEX_CACHE_LAST_REFRESH_UTC).total_seconds() < 20:
-        return
 
-    _OPGG_FLEX_CACHE_LAST_REFRESH_UTC = now_utc
-    _load_opgg_flex_cache()
+    # Avoid refresh storms: skip if we refreshed very recently (unless forced).
+    if (not force) and _OPGG_FLEX_CACHE_LAST_REFRESH_UTC and (now_utc - _OPGG_FLEX_CACHE_LAST_REFRESH_UTC).total_seconds() < 20:
+        return {"total_inserted": 0, "inserted_by_name": {}}
 
-    if not DPM_FLEX_PROFILES:
-        return
+    # If another refresh is running, either bail (normal) or wait our turn (force=True).
+    if _opgg_refresh_lock.locked() and not force:
+        return {"total_inserted": 0, "inserted_by_name": {}}
 
-    try:
-        from playwright.async_api import async_playwright
-    except Exception as e:
-        print(f"[OPGG][cache] Playwright not available: {type(e).__name__}: {e}")
-        return
+    async with _opgg_refresh_lock:
+        # Re-check convince: if we waited for the lock, another refresh may have just happened.
+        now_utc = datetime.now(timezone.utc)
+        if (not force) and _OPGG_FLEX_CACHE_LAST_REFRESH_UTC and (now_utc - _OPGG_FLEX_CACHE_LAST_REFRESH_UTC).total_seconds() < 20:
+            return {"total_inserted": 0, "inserted_by_name": {}}
 
-    print(f"[OPGG][cache] refresh start ({reason})")
+        _OPGG_FLEX_CACHE_LAST_REFRESH_UTC = now_utc
+        _load_opgg_flex_cache()
 
-    async with async_playwright() as p:
-        # You asked for headless=False so you can watch it scrape.
-        browser = await p.chromium.launch(headless=False)
-        context = await browser.new_context(locale="en-US")
+        if not DPM_FLEX_PROFILES:
+            return {"total_inserted": 0, "inserted_by_name": {}}
 
         try:
-            names = list(DPM_FLEX_PROFILES.keys())
+            from playwright.async_api import async_playwright
+        except Exception as e:
+            print(f"[OPGG][cache] playwright import failed: {type(e).__name__}: {e}")
+            return {"total_inserted": 0, "inserted_by_name": {}}
+
+        total_inserted = 0
+        inserted_by_name: dict[str, int] = {}
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=False)
+            context = await browser.new_context(locale="en-US")
+
+            async def fetch_one(name: str, opgg_url: str) -> tuple[str, list[dict] | None]:
+                try:
+                    ms = await asyncio.wait_for(
+                        _fetch_opgg_flex_matches_from_url(context, opgg_url),
+                        timeout=25,
+                    )
+                    return name, (ms or [])
+                except Exception as e:
+                    print(f"[OPGG][cache] scrape failed for {name}: {type(e).__name__}: {e}")
+                    return name, None
+
             tasks = []
-            for name in names:
-                prof = DPM_FLEX_PROFILES.get(name) or {}
-                url = prof.get("opgg_url") if isinstance(prof, dict) else None
-                if not isinstance(url, str) or not url:
-                    print(f"[OPGG][cache] missing opgg_url for {name}")
+            for name, prof in DPM_FLEX_PROFILES.items():
+                opgg_url = prof.get("opgg_url")
+                if not opgg_url:
+                    inserted_by_name[name] = 0
                     continue
-                tasks.append(_fetch_opgg_flex_matches_from_url(context, url))
+                tasks.append(fetch_one(name, opgg_url))
 
-            done = await asyncio.gather(*tasks, return_exceptions=True)
+            results = await asyncio.gather(*tasks, return_exceptions=False)
 
-            total_inserted = 0
-            # Note: tasks list may be shorter if a profile is missing a URL.
-            for name, res in zip([n for n in names if isinstance((DPM_FLEX_PROFILES.get(n) or {}).get("opgg_url"), str)], done):
-                if isinstance(res, Exception):
-                    print(f"[OPGG][cache] scrape failed for {name}: {type(res).__name__}: {res}")
+            for name, ms in results:
+                if not ms:
+                    inserted_by_name[name] = 0
                     continue
-                inserted = _cache_upsert_matches(name, res or [])
+                inserted = _cache_upsert_matches(name, ms)
+                inserted_by_name[name] = inserted
                 total_inserted += inserted
 
-            print(f"[OPGG][cache] refresh done ({reason}) inserted={total_inserted}")
-        finally:
             await context.close()
             await browser.close()
+
+        if total_inserted > 0:
+            _save_opgg_flex_cache()
+
+        print(f"[OPGG][cache] refresh done: inserted={total_inserted} reason={reason}")
+        return {"total_inserted": total_inserted, "inserted_by_name": inserted_by_name}
 
 
 async def compute_recent_flex_leaderboard_from_opgg_cache(hours: int = 18) -> tuple[list[dict], datetime, datetime]:
@@ -1791,7 +2068,7 @@ def format_flex_leaderboard(entries: list[dict], display_start, display_end) -> 
     MEDALS = ["🥇", "🥈", "🥉"]
 
     def _fmt_window(x):
-        return x.strftime("%m-%d %H:%M") if hasattr(x, "hour") else x.strftime("%m-%d")
+        return x.strftime("%m-%d")
 
     start_str = _fmt_window(display_start)
     end_str = _fmt_window(display_end)
@@ -2777,10 +3054,9 @@ _ready_synced = False
 
 @tasks.loop(minutes=30)
 async def opgg_cache_refresh_loop():
-    if _opgg_refresh_lock.locked():
-        return
-    async with _opgg_refresh_lock:
-        await refresh_opgg_flex_cache_best_effort(reason="loop_30m")
+    # Best-effort periodic refresh of OP.GG cache, then update any persistent leaderboard posts demostrar.
+    await refresh_opgg_flex_cache_best_effort(reason="loop_30m")
+    await _update_all_persistent_flex_messages(bot, reason="loop_30m")
 
 @opgg_cache_refresh_loop.before_loop
 async def _before_opgg_cache_refresh_loop():
@@ -2851,18 +3127,15 @@ async def on_message(message: discord.Message):
     # Ignore the bot’s own messages
     if message.author.id == bot.user.id:
         return
-    
     # Track "lenny/lennert" usage for Jeff (persistent)
     await record_lenny_if_needed(message)
 
     # HARD IGNORE: if user is in ignore list, ignore EVERY message (no processing, no responses)
     if is_ignored(message.author.id):
         return
-    
     # Global disable switch — block all on_message handling for everyone
     if is_globally_disabled():
         return
-
     # --- stochastic fun: tiny chance to reply or react to ANY message ---
     if message.channel.id == 753959443263389737:
         if random.random() < 0.0007:
@@ -2885,7 +3158,6 @@ async def on_message(message: discord.Message):
     if message.content.startswith(bot.command_prefix):
         await bot.process_commands(message)
         return
-
     # Determine if this counts as the bot being asked something
     is_mention = bot.user in message.mentions
     is_reply_to_bot = (
@@ -2895,7 +3167,6 @@ async def on_message(message: discord.Message):
     )
     if not (is_mention or is_reply_to_bot):
         return
-
     # SPAM CHECK: if punished, reply with "fuck u" and bail
     if await record_ask_and_check_punish(message.author.id):
         # Try to react to the user's most recent message in this channel
@@ -2907,7 +3178,6 @@ async def on_message(message: discord.Message):
         except Exception:
             pass
         return
-
     # Extract optional inline context window e.g. "(2hrs)" at the start
     def parse_window(text: str):
         """
@@ -2994,12 +3264,9 @@ async def on_raw_reaction_add(payload):
     # ignore the bot itself
     if payload.user_id == bot.user.id:
         return
-
     # limit to your channel(s). Option A: single channel id
     if payload.channel_id != 753959443263389737:
         return
-    
-
     # roll the same 5% chance as before
     if random.random() >= 0.05:
         return
@@ -3023,7 +3290,6 @@ async def ask(ctx, *, question: str):
     # HARD IGNORE: don't process if user is ignored
     if is_ignored(ctx.author.id):
         return
-
     # SPAM CHECK
     if await record_ask_and_check_punish(ctx.author.id):
         try:
@@ -3031,7 +3297,6 @@ async def ask(ctx, *, question: str):
         except Exception:
             pass
         return
-
     def parse_window(text: str):
         m = re.match(r"^\s*\((\d+)\s*(hrs?|h|mins?|m|days?|d)\)\s*", text, flags=re.IGNORECASE)
         if not m:
@@ -3139,7 +3404,6 @@ async def summary(ctx, *, time_frame: str = "2hrs"):
         if not start_time or not end_time:
             await ctx.reply("Invalid date range. Try '2025-09-10 18:00 to now', '2hrs', '30min', or 'msg'.")
             return
-
         # Collect messages and render with safe separators
         msgs = []
         async for m in ctx.channel.history(limit=2000, after=start_time, before=end_time, oldest_first=True):
@@ -3149,7 +3413,6 @@ async def summary(ctx, *, time_frame: str = "2hrs"):
         if not msgs:
             await ctx.reply("No messages found in that window.")
             return
-
         convo = "\n".join(msgs)
         system_prompt = "a"
 
@@ -3431,13 +3694,11 @@ class GeneralCog(commands.Cog):
         # HARD IGNORE: if user is ignored, completely ignore (no response)
         if is_ignored(interaction.user.id):
             return
-
         # SPAM CHECK
         if await record_ask_and_check_punish(interaction.user.id):
             # respond with "fuck u" (not ephemeral so it's visible like normal answers)
             await interaction.response.send_message("fuck u")
             return
-
         await interaction.response.defer()  # shows typing / “thinking…”
 
         def parse_window(text: str):
@@ -3511,14 +3772,12 @@ class GeneralCog(commands.Cog):
         if interaction.guild is None:
             await interaction.response.send_message("This only works in a server.", ephemeral=True)
             return
-
         await interaction.response.defer(ephemeral=True)
 
         # Parse ID
         if not channel_id.isdigit():
             await interaction.followup.send("Channel ID must be numeric.", ephemeral=True)
             return
-
         cid = int(channel_id)
 
         # Fetch channel
@@ -3529,19 +3788,16 @@ class GeneralCog(commands.Cog):
             except Exception as e:
                 await interaction.followup.send(f"Couldn't find that channel: {e}", ephemeral=True)
                 return
-
         # Validate it's a voice channel (or stage)
         if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
             await interaction.followup.send("That channel ID is not a voice/stage channel.", ephemeral=True)
             return
-
         # Permissions check (connect)
         me = interaction.guild.me or interaction.guild.get_member(self.bot.user.id)
         perms = channel.permissions_for(me)
         if not perms.connect:
             await interaction.followup.send("I don't have permission to CONNECT to that channel.", ephemeral=True)
             return
-
         # Connect / move
         vc = interaction.guild.voice_client
         try:
@@ -3550,7 +3806,6 @@ class GeneralCog(commands.Cog):
                     await vc.move_to(channel)
                 await interaction.followup.send(f"✅ Connected to **{channel.name}**.", ephemeral=True)
                 return
-
             await channel.connect(timeout=20, reconnect=True)
             await interaction.followup.send(f"✅ Connected to **{channel.name}**.", ephemeral=True)
 
@@ -3562,12 +3817,10 @@ class GeneralCog(commands.Cog):
         if interaction.guild is None:
             await interaction.response.send_message("This only works in a server.", ephemeral=True)
             return
-
         vc = interaction.guild.voice_client
         if not vc or not vc.is_connected():
             await interaction.response.send_message("I'm not connected to any voice channel.", ephemeral=True)
             return
-
         try:
             await vc.disconnect(force=True)
             await interaction.response.send_message("👋 Left the voice channel.", ephemeral=True)
@@ -3699,7 +3952,6 @@ class GeneralCog(commands.Cog):
                 message = await interaction.followup.send(embed=embed)
                 # Adding reaction is optional; note that interactions may require fetching the message object
                 return
-
             view = BlackjackView(player_hand, dealer_hand, bet)
             embed = create_game_embed(interaction.user, player_hand, dealer_hand, bet)
             message = await interaction.followup.send(embed=embed, view=view)
@@ -3857,7 +4109,6 @@ class GeneralCog(commands.Cog):
                 f"❌ Error while fetching or scoring the match: `{e}`"
             )
             return
-
         info = match_data.get("info", {})
         queue_id = info.get("queueId")
         queue_name = QUEUE_ID_TO_NAME.get(queue_id, f"Queue {queue_id}")
@@ -3946,6 +4197,7 @@ class GeneralCog(commands.Cog):
         # Only refresh if explicitly requested
         if refresh == "1":
             await refresh_opgg_flex_cache_best_effort(reason="command")
+        await _update_all_persistent_flex_messages(self.bot, reason="weekly_flex_leaderboard")
 
         entries, week_start, now = await compute_weekly_flex_leaderboard_from_opgg_cache()
         msg = format_flex_leaderboard(entries, week_start, now)
@@ -3968,6 +4220,7 @@ class GeneralCog(commands.Cog):
         await self.bot.wait_until_ready()
         # Prime the cache once at startup so /weekly_flex_leaderboard works immediately.
         await refresh_opgg_flex_cache_best_effort(reason="startup")
+        await _update_all_persistent_flex_messages(self.bot, reason="startup")
 
     # Runs every day at local midnight; only posts on Monday 00:00 local
     # which is effectively "Sunday night at midnight".
@@ -3979,7 +4232,6 @@ class GeneralCog(commands.Cog):
         # Monday is 0; we only post at Monday 00:00
         if now_local.weekday() != 0:
             return
-
         await refresh_opgg_flex_cache_best_effort(reason="command")
         entries, week_start, now = await compute_weekly_flex_leaderboard_from_opgg_cache()
         msg = format_flex_leaderboard(entries, week_start, now)
@@ -3991,7 +4243,6 @@ class GeneralCog(commands.Cog):
         if channel is None:
             print(f"[FlexLB] Could not find channel {FLEX_LEADERBOARD_CHANNEL_ID}")
             return
-
         await channel.send(msg)
 
     @flex_weekly_leaderboard_task.before_loop
@@ -4011,10 +4262,176 @@ class GeneralCog(commands.Cog):
         # Only refresh if explicitly requested
         if refresh == "1":
             await refresh_opgg_flex_cache_best_effort(reason="post_leaderboard")
+        await _update_all_persistent_flex_messages(self.bot, reason="flex_leaderboard_session")
 
         entries, start_utc, end_utc = await compute_recent_flex_leaderboard_from_opgg_cache(hours=18)
         msg = format_recent_flex_leaderboard(entries, start_utc, end_utc)
         await interaction.followup.send(msg)
+
+
+    @app_commands.command(
+        name="persistent_weekly_flex",
+        description="Post a persistent weekly flex leaderboard (one message, edited in-place).",
+    )
+    @app_commands.describe(message_id="(Optional) Existing message ID to adopt as the persistent weekly leaderboard.")
+    async def persistent_weekly_flex(self, interaction: Interaction, message_id: str | None = None):
+        # Ephemeral ack so we don't spam chat; the leaderboard itself is a normal channel message.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        if interaction.guild is None or interaction.channel is None:
+            await interaction.followup.send("This only works in a server channel.", ephemeral=True)
+            return
+
+        entries, week_start, now = await compute_weekly_flex_leaderboard_from_opgg_cache()
+        header = _format_last_updated_header(datetime.now(timezone.utc))
+        body = format_flex_leaderboard(entries, week_start, now)
+        body = body.replace("WEEKLY FLEX LEADERBOARD", "PERSISTENT WEEKLY FLEX LEADERBOARD", 1)
+        content = header + "\n" + body
+
+        if message_id:
+            try:
+                mid = int(str(message_id).strip())
+            except Exception:
+                await interaction.followup.send("Invalid message_id (must be a numeric Discord message ID).", ephemeral=True)
+                return
+
+            try:
+                target_msg = await interaction.channel.fetch_message(mid)
+            except Exception:
+                await interaction.followup.send("Couldn't find that message in this channel.", ephemeral=True)
+                return
+
+            try:
+                await target_msg.edit(content=content)
+            except Exception:
+                await interaction.followup.send("I couldn't edit that message (missing perms or it's not editable).", ephemeral=True)
+                return
+
+            _set_persistent_pointer(
+                "weekly",
+                int(interaction.guild.id),
+                channel_id=int(interaction.channel.id),
+                message_id=int(target_msg.id),
+            )
+            await interaction.followup.send("✅ Adopted that message as the **persistent weekly** leaderboard.", ephemeral=True)
+            return
+
+        msg_obj = await interaction.channel.send(content)
+        _set_persistent_pointer(
+            "weekly",
+            int(interaction.guild.id),
+            channel_id=int(interaction.channel.id),
+            message_id=int(msg_obj.id),
+        )
+        await interaction.followup.send("✅ Posted a new **persistent weekly** leaderboard (I’ll keep editing it).", ephemeral=True)
+
+
+    @app_commands.command(
+        name="persistent_session_flex",
+        description="Post a persistent session flex leaderboard (one message, edited in-place).",
+    )
+    @app_commands.describe(message_id="(Optional) Existing message ID to adopt as the persistent session leaderboard.")
+    async def persistent_session_flex(self, interaction: discord.Interaction, message_id: str | None = None):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        if interaction.guild is None or interaction.channel is None:
+            await interaction.followup.send("This only works in a server channel.", ephemeral=True)
+            return
+
+        entries, start_utc, end_utc = await compute_recent_flex_leaderboard_from_opgg_cache(hours=18)
+        header = _format_last_updated_header(datetime.now(timezone.utc))
+        body = format_recent_flex_leaderboard(entries, start_utc, end_utc)
+        body = body.replace("SESSION FLEX LEADERBOARD", "PERSISTENT SESSION FLEX LEADERBOARD", 1)
+        content = header + "\n" + body
+
+        if message_id:
+            try:
+                mid = int(str(message_id).strip())
+            except Exception:
+                await interaction.followup.send("Invalid message_id (must be a numeric Discord message ID).", ephemeral=True)
+                return
+
+            try:
+                target_msg = await interaction.channel.fetch_message(mid)
+            except Exception:
+                await interaction.followup.send("Couldn't find that message in this channel.", ephemeral=True)
+                return
+
+            try:
+                await target_msg.edit(content=content)
+            except Exception:
+                await interaction.followup.send("I couldn't edit that message (missing perms or it's not editable).", ephemeral=True)
+                return
+
+            _set_persistent_pointer(
+                "session",
+                int(interaction.guild.id),
+                channel_id=int(interaction.channel.id),
+                message_id=int(target_msg.id),
+            )
+            await interaction.followup.send("✅ Adopted that message as the **persistent session** leaderboard.", ephemeral=True)
+            return
+
+        msg_obj = await interaction.channel.send(content)
+        _set_persistent_pointer(
+            "session",
+            int(interaction.guild.id),
+            channel_id=int(interaction.channel.id),
+            message_id=int(msg_obj.id),
+        )
+        await interaction.followup.send("✅ Posted a new **persistent session** leaderboard (I’ll keep editing it).", ephemeral=True)
+
+
+    @app_commands.command(
+        name="refresh_flex",
+        description="Aggressively refresh OP.GG flex data until a NEW qualifying 5-man flex game appears.",
+    )
+    async def refresh_flex(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        required = min(5, len(DPM_FLEX_PROFILES.keys())) if DPM_FLEX_PROFILES else 5
+        before_id, before_time = _latest_qualifying_flex_match_info_from_cache()
+
+        max_attempts = 20
+        sleep_seconds = 5
+
+        status_msg = await interaction.followup.send(
+            f"🔄 Waiting for OP.GG… (need a NEW qualifying flex game with ≥{required} tracked players)",
+            ephemeral=True,
+        )
+
+        for attempt in range(1, max_attempts + 1):
+            await refresh_opgg_flex_cache_best_effort(reason=f"refresh_flex_attempt_{attempt}", force=True)
+
+            after_id, after_time = _latest_qualifying_flex_match_info_from_cache()
+            changed = (after_id is not None and after_id != before_id)
+
+            try:
+                await status_msg.edit(
+                    content=(
+                        f"🔄 Waiting for OP.GG to publish the new 5-man Flex game...\n"
+                        f"Newest qualifying match time: **{_format_match_time_et(after_time)}**\n"
+                        f"Attempt **{attempt}/{max_attempts}**"
+                    )
+                )
+            except Exception:
+                pass
+
+            if changed:
+                await _update_all_persistent_flex_messages(self.bot, reason="refresh_flex")
+                await interaction.followup.send(
+                    f"✅ New qualifying Flex match detected: **{_format_match_time_et(after_time)}**",
+                    ephemeral=True,
+                )
+                return
+
+            await asyncio.sleep(sleep_seconds)
+
+        await _update_all_persistent_flex_messages(self.bot, reason="refresh_flex_timeout")
+        await interaction.followup.send(
+            "⚠️ Timed out waiting for OP.GG to publish the new 5-man flex game for everyone. Try again in a minute.",
+            ephemeral=True,
+        )
 
     @app_commands.command(
         name="lenny",
@@ -4116,7 +4533,6 @@ class SummaryCog(commands.Cog):
             if not start_time or not end_time:
                 await interaction.followup.send("Invalid date range. Try 'YYYY-MM-DD HH:MM to now', '2hrs', '30min', or 'msg'.", ephemeral=True)
                 return
-
             msgs = []
             async for m in interaction.channel.history(limit=2000, after=start_time, before=end_time, oldest_first=True):
                 if m.content.strip():
@@ -4125,7 +4541,6 @@ class SummaryCog(commands.Cog):
             if not msgs:
                 await interaction.followup.send("No messages found in that window.", ephemeral=True)
                 return
-
             convo = "\n".join(msgs)
             system_prompt = "a"
             summary_prompt = (
@@ -4184,7 +4599,6 @@ async def daily(ctx):
             minutes, seconds = divmod(remainder, 60)
             await ctx.reply(f"You need to wait {hours} hours, {minutes} minutes, and {seconds} seconds before claiming your daily reward again, Mon. Sometimes making big business moves takes patience.")
             return
-
     daily_amount = 500
     await add_income(user_id, daily_amount)
     daily_cooldowns[user_id] = current_time
@@ -4199,7 +4613,6 @@ async def slots(ctx):
     if balance >= 101:
         await ctx.reply(f"Sorry, the slots are only for blue collar workers with less than 100 coins. Your current balance is **{balance} coins**. You're too white collar for that, Mon!")
         return
-    
     roll = random.choices(range(1, 1001), weights=[1000-i for i in range(1000)])[0]
     
     # Determine the win amount based on the roll
@@ -4254,20 +4667,17 @@ async def bj(ctx, bet_amount: str = None):
     if user_id in active_games:
         await ctx.reply("You already have an active game, Mon. Please finish it before starting a new one. Making big business moves requires focus.")
         return
-
     balance = user_balances.get(user_id, 0)
 
     if bet_amount is None:
         await ctx.reply(f"Please specify a bet amount. Your current balance is **{balance} coins**, Mon.\n"
                         f"Usage: `!bj <amount>`, `!bj half`, `!bj all`, or `!bj <percentage>%`")
         return
-
     bet = parse_bet_amount(bet_amount, balance)
     if bet is None or bet <= 99 or bet > balance:
         await ctx.reply(f"Invalid bet amount. Please bet an amount at least 100 coins. Can't make big business moves with small change, Mon."
                         f"Your current balance is **{balance} coins**, Mon. You can get more coins by using /slots")
         return
-
     active_games.add(user_id)
 
     try:
@@ -4305,7 +4715,6 @@ async def bj(ctx, bet_amount: str = None):
                 await message.add_reaction("🎉")
             
             return
-
         view = BlackjackView(player_hand, dealer_hand, bet)
         message = await ctx.reply(embed=create_game_embed(ctx.author, player_hand, dealer_hand, bet), view=view)
 
@@ -4876,7 +5285,6 @@ class CustomsLobbyView(discord.ui.View):
         if len(self.lobby_data.players) >= self.lobby_data.max_players:
             await interaction.response.send_message("Lobby is already full.", ephemeral=True)
             return
-
         # ADD the real user
         self.lobby_data.players.append(user)
         await self.update_lobby_message()
@@ -4895,7 +5303,6 @@ class CustomsLobbyView(discord.ui.View):
             self.lobby_data.draft_phase = 'captain_selection'
             await self.start_captain_selection()
             return
-
         # unchanged: full-lobby start
         if len(self.lobby_data.players) == self.lobby_data.max_players:
             self.lobby_data.draft_phase = 'captain_selection'
@@ -4967,7 +5374,6 @@ class CaptainDropdown(discord.ui.Select):
                 ephemeral=True
             )
             return
-
         # Proceed to assign captains
         selected = self.values  # list of two user IDs (strings)
         self.lobby_data.captains = [
@@ -5009,7 +5415,6 @@ class HeadsTailsSelect(discord.ui.View):  # NEW: coin-flip prompt
                 ephemeral=True
             )
             return
-
         guess  = select.values[0]
         result = random.choice(["heads", "tails"])
 
@@ -5062,7 +5467,6 @@ class SideChoiceSelect(discord.ui.View):  # NEW: side-selection (incl. random)
                 ephemeral=True
             )
             return
-
         choice = select.values[0]
         # handle Random by picking for them
         if choice == "random":
@@ -5106,7 +5510,6 @@ class SideSelect(discord.ui.View):
                 ephemeral=True
             )
             return
-
         choice = select.values[0]
         self.lobby_data.side_selected = 0 if choice == 'blue' else 1
         self.lobby_data.draft_phase = 'drafting'
@@ -5251,7 +5654,6 @@ class DraftDropdown(discord.ui.Select):
                 ephemeral=True
             )
             return
-
         # ——— Perform the pick(s) ———
         # NEW: resolve both real and fake players from our lobby_data
         picks = []
@@ -5498,18 +5900,15 @@ class RPSAcceptView(discord.ui.View):
         if interaction.user.id != self.challenged.id:
             await interaction.response.send_message("Only the challenged user can respond. (Waiting for response…)", ephemeral=True)
             return
-
         # Check if the challenged has enough funds.
         if user_balances.get(str(self.challenged.id), 0) < self.wager:
             await interaction.response.send_message("You don't have enough coins to accept this challenge.", ephemeral=True)
             return
-
         # Deduct funds from challenged.
         success = await deduct_points(str(self.challenged.id), self.wager)
         if not success:
             await interaction.response.send_message("Failed to deduct coins. Challenge cancelled.", ephemeral=True)
             return
-
         self.challenge_over = True  # Stop the countdown
 
         # Update the message to announce game start.
@@ -5529,7 +5928,6 @@ class RPSAcceptView(discord.ui.View):
         if interaction.user.id != self.challenged.id:
             await interaction.response.send_message("Only the challenged user can respond. (Waiting for response…)", ephemeral=True)
             return
-
         self.challenge_over = True  # Stop the countdown
 
         # Refund the challenger's wager.
@@ -5562,7 +5960,6 @@ class RPSGameView(discord.ui.View):
         choice2 = self.choices.get(self.challenged.id)
         if choice1 is None or choice2 is None:
             return
-
         total_pot = self.wager * 2
         result_text = ""
         if choice1 == choice2:
@@ -5643,13 +6040,11 @@ class RPSCog(commands.Cog):
         if user_balances.get(str(challenger.id), 0) < wager:
             await interaction.response.send_message("You don't have enough coins to wager that amount.", ephemeral=True)
             return
-
         # Deduct the wager from the challenger.
         success = await deduct_points(str(challenger.id), wager)
         if not success:
             await interaction.response.send_message("Failed to deduct wager from your balance.", ephemeral=True)
             return
-
         # Create the challenge embed with initial countdown.
         embed = discord.Embed(
             title="Rock Paper Scissors Challenge",
@@ -5680,12 +6075,10 @@ class RPSCog(commands.Cog):
         if user_balances.get(str(challenger.id), 0) < wager:
             await ctx.send("You don't have enough coins to wager that amount.")
             return
-
         success = await deduct_points(str(challenger.id), wager)
         if not success:
             await ctx.send("Failed to deduct wager from your balance.")
             return
-
         embed = discord.Embed(
             title="Rock Paper Scissors Challenge",
             description=(
@@ -5757,7 +6150,6 @@ class AdminRollCog(commands.Cog):
         except Exception as e:
             print(f"Error reading admin candidates file: {e}")
             return
-
         current_time = time.time()
 
         # Load the last admin times (if a candidate has never been admin, default to 0)
@@ -5788,7 +6180,6 @@ class AdminRollCog(commands.Cog):
         if len(selected) < 3:
             print("Not enough admin candidates available.")
             return
-
         # Update last admin times for the selected candidates so their chances reset
         for uid in selected:
             last_admin_times[uid] = current_time
@@ -5807,7 +6198,6 @@ class AdminRollCog(commands.Cog):
         if not role:
             print("Admin role not found")
             return
-
         # Remove the admin role from last week's admins
         last_admins = await self.load_last_admins()
         for uid in last_admins:
@@ -5896,6 +6286,5 @@ async def setup(bot):
 
 # Run the bot
 bot.run(DISCORD_TOKEN)
-
 
 
