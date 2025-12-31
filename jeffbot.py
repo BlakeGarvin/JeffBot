@@ -1176,7 +1176,7 @@ async def _fetch_opgg_flex_matches_from_url(context, opgg_url: str) -> list[dict
         cache_bust = int(time.time())
         sep = "&" if "?" in opgg_url else "?"
         url = f"{opgg_url}{sep}t={cache_bust}"
-        await page.goto(opgg_url, wait_until="domcontentloaded", timeout=60_000)
+        await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
 
         # Give the page time to kick off its RSC requests.
         # OP.GG can be slow / bursty; a slightly longer settle helps a lot.
@@ -1189,7 +1189,7 @@ async def _fetch_opgg_flex_matches_from_url(context, opgg_url: str) -> list[dict
         await page.wait_for_timeout(1500)
 
         # Wait up to 25s for the big payload
-        await asyncio.wait_for(got_payload.wait(), timeout=25)
+        await asyncio.wait_for(got_payload.wait(), timeout=40)
 
     except Exception as e:
         # If we never got a big payload, bail cleanly
@@ -1757,7 +1757,7 @@ async def refresh_opgg_flex_cache_best_effort(reason: str = "manual", *, force: 
                 try:
                     ms = await asyncio.wait_for(
                         _fetch_opgg_flex_matches_from_url(context, opgg_url),
-                        timeout=25,
+                        timeout=90,
                     )
                     return name, (ms or [])
                 except Exception as e:
@@ -1989,7 +1989,7 @@ async def compute_weekly_flex_leaderboard_from_opgg() -> tuple[list[dict], datet
             # hard cap each profile scrape to 25s
             return await asyncio.wait_for(
                 _fetch_opgg_flex_matches_from_url(context, url),
-                timeout=25,
+                timeout=90,
             )
 
         tasks = []
