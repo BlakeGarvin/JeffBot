@@ -4395,7 +4395,7 @@ class GeneralCog(commands.Cog):
 
     @app_commands.command(
         name="refresh_flex",
-        description="Refresh OP.GG flex cache once, or (optionally) keep refreshing until a NEW qualifying 5-man flex game appears.",
+        description="Refresh flex history, optionally spam refresh until new game",
     )
     @app_commands.describe(wait_for_new="0 = refresh once (default). 1 = keep refreshing until a new qualifying game appears.")
     async def refresh_flex(self, interaction: discord.Interaction, wait_for_new: int = 0):
