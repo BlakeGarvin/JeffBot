@@ -1,3 +1,4 @@
 .env
 opgg_flex_cache.json
 flex_rank_snapshots.json
+flex_persistent_messages.json

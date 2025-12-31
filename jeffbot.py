@@ -1432,51 +1432,6 @@ async def _upsert_persistent_message(
         # If we can't prove the message is editable anymore, forget the pointer so the next call can recreate.
         _delete_persistent_pointer(kind, guild_id)
 
-def _latest_qualifying_flex_match_info_from_cache() -> tuple[str | None, datetime | None]:
-    """
-    Returns (match_id, created_at_utc) for the most recent qualifying flex match in the cache.
-    Qualifying = match_id appears for >=5 tracked members.
-    """
-    counts: dict[str, int] = {}
-    created_at_by_id: dict[str, datetime] = {}
-
-    for name in DPM_FLEX_PROFILES.keys():
-        for m in _iter_cached_matches(name) or []:
-            mid = m.get("match_id")
-            if not mid:
-                continue
-            counts[mid] = counts.get(mid, 0) + 1
-
-            created = m.get("created_at")
-            if isinstance(created, datetime):
-                created_utc = _coerce_dt_to_utc(created)
-                prev = created_at_by_id.get(mid)
-                if prev is None or created_utc > prev:
-                    created_at_by_id[mid] = created_utc
-
-    # most recent match_id among those with >=5 appearances
-    best_id = None
-    best_t = None
-    for mid, c in counts.items():
-        if c < 5:
-            continue
-        t = created_at_by_id.get(mid)
-        if t is None:
-            continue
-        if best_t is None or t > best_t:
-            best_t = t
-            best_id = mid
-
-    return best_id, best_t
-
-
-def _format_match_time_et(dt_utc: datetime | None) -> str:
-    if not isinstance(dt_utc, datetime):
-        return "Unknown time"
-    dt_et = dt_utc.astimezone(DETROIT_TZ)
-    # No year, human-friendly:
-    return dt_et.strftime("%m-%d %I:%M %p").lstrip("0").replace(" 0", " ")
-
 
 def _latest_qualifying_flex_match_id_from_cache(min_group_size: int = 5) -> str | None:
     """Return the newest match_id that appears in the cache for >= min_group_size tracked members."""
@@ -1515,6 +1470,62 @@ def _latest_qualifying_flex_match_id_from_cache(min_group_size: int = 5) -> str 
             best_mid = mid
 
     return best_mid
+
+def _latest_qualifying_flex_match_info_from_cache(min_group_size: int = 5) -> tuple[str | None, datetime | None]:
+    """Return (match_id, created_at_utc) for newest qualifying match in cache.
+
+    Qualifying means the same match_id appears for >= min_group_size tracked members.
+    """
+    tracked = list(DPM_FLEX_PROFILES.keys())
+    if not tracked:
+        return None, None
+
+    # match_id -> {"count": int, "best_created_at": datetime|None}
+    agg: dict[str, dict] = {}
+
+    for name in tracked:
+        for m in (_iter_cached_matches(name) or []):
+            mid = m.get("match_id")
+            if not mid:
+                continue
+            created = m.get("created_at")
+            created_utc = _coerce_dt_to_utc(created) if isinstance(created, datetime) else None
+
+            bucket = agg.get(mid)
+            if bucket is None:
+                agg[mid] = {"count": 1, "best_created_at": created_utc}
+            else:
+                bucket["count"] = int(bucket.get("count", 0)) + 1
+                bt = bucket.get("best_created_at")
+                if bt is None or (created_utc is not None and created_utc > bt):
+                    bucket["best_created_at"] = created_utc
+
+    best_mid = None
+    best_t = None
+    for mid, info in agg.items():
+        if int(info.get("count", 0)) < int(min_group_size):
+            continue
+        t = info.get("best_created_at")
+        if t is None:
+            continue
+        if best_t is None or t > best_t:
+            best_t = t
+            best_mid = mid
+
+    return best_mid, best_t
+
+
+def _format_dt_et_short(dt_utc: datetime | None) -> str:
+    """Format UTC datetime into ET without year/timezone (MM-DD H:MM AM/PM)."""
+    if not isinstance(dt_utc, datetime):
+        return "—"
+    dt_et = dt_utc.astimezone(DETROIT_TZ)
+    # e.g. 12-31 4:07 PM
+    s = dt_et.strftime("%m-%d %I:%M %p")
+    # remove leading 0s like 04:07 -> 4:07 and 01-02 -> 1-02? keep month/day two-digit for clarity
+    s = s.replace(" 0", " ")
+    return s
+
 
 
 async def _update_all_persistent_flex_messages(bot: commands.Bot, *, reason: str = "refresh") -> None:
@@ -1775,7 +1786,7 @@ async def refresh_opgg_flex_cache_best_effort(reason: str = "manual", *, force: 
             await browser.close()
 
         if total_inserted > 0:
-            _save_opgg_flex_cache()
+            _save_opgg_flex_cache(_OPGG_FLEX_CACHE)
 
         print(f"[OPGG][cache] refresh done: inserted={total_inserted} reason={reason}")
         return {"total_inserted": total_inserted, "inserted_by_name": inserted_by_name}
@@ -4384,34 +4395,48 @@ class GeneralCog(commands.Cog):
 
     @app_commands.command(
         name="refresh_flex",
-        description="Aggressively refresh OP.GG flex data until a NEW qualifying 5-man flex game appears.",
+        description="Refresh OP.GG flex cache once, or (optionally) keep refreshing until a NEW qualifying 5-man flex game appears.",
     )
-    async def refresh_flex(self, interaction: discord.Interaction):
+    @app_commands.describe(wait_for_new="0 = refresh once (default). 1 = keep refreshing until a new qualifying game appears.")
+    async def refresh_flex(self, interaction: discord.Interaction, wait_for_new: int = 0):
         await interaction.response.defer(ephemeral=True, thinking=True)
 
         required = min(5, len(DPM_FLEX_PROFILES.keys())) if DPM_FLEX_PROFILES else 5
-        before_id, before_time = _latest_qualifying_flex_match_info_from_cache()
 
-        max_attempts = 20
-        sleep_seconds = 5
+        # Default: refresh once
+        if int(wait_for_new) != 1:
+            result = await refresh_opgg_flex_cache_best_effort(reason="refresh_flex_once", force=True)
+            await _update_all_persistent_flex_messages(self.bot, reason="refresh_flex_once")
+
+            _mid, t_utc = _latest_qualifying_flex_match_info_from_cache(min_group_size=required)
+            inserted_total = int((result or {}).get("total_inserted", 0))
+            await interaction.followup.send(
+                f"✅ Refreshed once. Inserted **{inserted_total}** new matches.\nNewest qualifying match: **{_format_dt_et_short(t_utc)}**",
+                ephemeral=True,
+            )
+            return
+
+        # Optional: keep refreshing until a NEW qualifying game appears
+        before_mid, before_t = _latest_qualifying_flex_match_info_from_cache(min_group_size=required)
+
+        max_attempts = 90
+        sleep_seconds = 4
 
         status_msg = await interaction.followup.send(
-            f"🔄 Waiting for OP.GG… (need a NEW qualifying flex game with ≥{required} tracked players)",
+            f"🔄 Waiting for OP.GG… (need a NEW qualifying flex game with ≥{required} tracked players)\nCurrent qualifying match: **{_format_dt_et_short(before_t)}**",
             ephemeral=True,
         )
 
         for attempt in range(1, max_attempts + 1):
             await refresh_opgg_flex_cache_best_effort(reason=f"refresh_flex_attempt_{attempt}", force=True)
 
-            after_id, after_time = _latest_qualifying_flex_match_info_from_cache()
-            changed = (after_id is not None and after_id != before_id)
+            after_mid, after_t = _latest_qualifying_flex_match_info_from_cache(min_group_size=required)
+            changed = (after_mid is not None and after_mid != before_mid)
 
             try:
                 await status_msg.edit(
                     content=(
-                        f"🔄 Waiting for OP.GG to publish the new 5-man Flex game...\n"
-                        f"Newest qualifying match time: **{_format_match_time_et(after_time)}**\n"
-                        f"Attempt **{attempt}/{max_attempts}**"
+                        f"🔄 Waiting for OP.GG… (need a NEW qualifying flex game with ≥{required} tracked players)\nAttempt **{attempt}/{max_attempts}**. Newest qualifying match: **{_format_dt_et_short(after_t)}**"
                     )
                 )
             except Exception:
@@ -4420,7 +4445,7 @@ class GeneralCog(commands.Cog):
             if changed:
                 await _update_all_persistent_flex_messages(self.bot, reason="refresh_flex")
                 await interaction.followup.send(
-                    f"✅ New qualifying Flex match detected: **{_format_match_time_et(after_time)}**",
+                    f"✅ New qualifying flex game detected: **{_format_dt_et_short(after_t)}** — cache refreshed.",
                     ephemeral=True,
                 )
                 return
@@ -4429,7 +4454,7 @@ class GeneralCog(commands.Cog):
 
         await _update_all_persistent_flex_messages(self.bot, reason="refresh_flex_timeout")
         await interaction.followup.send(
-            "⚠️ Timed out waiting for OP.GG to publish the new 5-man flex game for everyone. Try again in a minute.",
+            "⚠️ Timed out waiting for OP.GG to publish the new 5-man flex game. Try again in a minute.",
             ephemeral=True,
         )
 
