@@ -3178,6 +3178,7 @@ SPECTATE_TARGETS = [
     {"label": "brionacc#deaf", "game_name": "brionacc", "tag_line": "deaf"},
     {"label": "unchands#haha", "game_name": "unchands", "tag_line": "haha"},
     {"label": "foxchar#9423", "game_name": "foxchar", "tag_line": "9423"},
+    {"label": "teacup#boop", "game_name": "teacup", "tag_line": "boop"},
 ]
 
 # account-v1 is regional routing
