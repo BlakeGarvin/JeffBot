@@ -64,7 +64,14 @@ FLEX_RANK_SNAPSHOTS_FILE = os.path.join(SCRIPT_DIR, "flex_rank_snapshots.json")
 # Persistent Flex leaderboard message pointers (so the bot can edit 1 message instead of spamming new ones)
 FLEX_PERSISTENT_MESSAGES_FILE = os.path.join(SCRIPT_DIR, "flex_persistent_messages.json")
 
+JOSH_GUILD_ID = 753949534387961877
+JOSH_USER_ID = 187737483088232449
 
+# Josh's SoloQ is on NA1 (platform routing for summoner/league endpoints)
+JOSH_LOL_PLATFORM = "na1"
+
+# Persist last seen LP so restarts don't spam edits
+JOSH_SOLOQ_STATE_FILE = "josh_soloq_lp_state.json"
 
 USE_SUMMARY_FOR_CONTEXT = False
 JEFF = True
@@ -365,6 +372,82 @@ EXPECTED_KP = 0.55  # rough "good" kill participation baseline
 
 _ignore_state = {"ignored": [], "cooldowns": {}}  # {"ignored":[str(user_id),...], "cooldowns": {str(user_id): last_toggle_epoch}}
 _spam_state = {"punished_until": {}, "recent": {}}  # punished_until: {str(user_id): epoch}, recent: {str(user_id): [epochs]}
+
+JOSH_RIOT_GAME_NAME = "DrkCloak"
+JOSH_RIOT_TAG_LINE = "NA1"
+JOSH_ACCOUNT_ROUTING = "americas"  # for NA riot-id lookups
+
+async def _get_puuid_by_riot_id(session: aiohttp.ClientSession, api_key: str, game_name: str, tag_line: str) -> str:
+    url = (
+        f"https://{JOSH_ACCOUNT_ROUTING}.api.riotgames.com"
+        f"/riot/account/v1/accounts/by-riot-id/{quote(game_name)}/{quote(tag_line)}"
+    )
+    data = await _riot_get_json(session, url, api_key)
+    puuid = data.get("puuid")
+    if not puuid:
+        raise RuntimeError(f"[JoshLP] account-v1 missing puuid: {data}")
+    return puuid
+
+def _load_josh_soloq_state() -> dict:
+    # shape: {"version": 1, "last_lp": int|None, "last_tier": str|None}
+    base = {"version": 1, "last_lp": None, "last_tier": None}
+    try:
+        if not os.path.exists(JOSH_SOLOQ_STATE_FILE):
+            return base
+        with open(JOSH_SOLOQ_STATE_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f) or {}
+        base["last_lp"] = raw.get("last_lp")
+        base["last_tier"] = raw.get("last_tier")
+        return base
+    except Exception as e:
+        print(f"[JoshLP] Error loading state: {e}")
+        return base
+
+
+def _save_josh_soloq_state(last_lp: int | None, last_tier: str | None) -> None:
+    try:
+        payload = {"version": 1, "last_lp": last_lp, "last_tier": last_tier}
+        with open(JOSH_SOLOQ_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+    except Exception as e:
+        print(f"[JoshLP] Error saving state: {e}")
+
+
+async def _get_josh_soloq_lp_and_tier(session: aiohttp.ClientSession, api_key: str) -> tuple[int | None, str | None]:
+    """
+    Returns (lp, tier) for RANKED_SOLO_5x5, or (None, None) if no SoloQ entry.
+    """
+    puuid = await _get_puuid_by_riot_id(session, api_key, JOSH_RIOT_GAME_NAME, JOSH_RIOT_TAG_LINE)
+
+    # IMPORTANT: quote the puuid to avoid URL issues
+    url = f"https://{JOSH_LOL_PLATFORM}.api.riotgames.com/lol/league/v4/entries/by-puuid/{quote(puuid, safe='')}"
+    entries = await _riot_get_json(session, url, api_key)
+
+    if not isinstance(entries, list):
+        raise RuntimeError(f"[JoshLP] Unexpected league response: {entries}")
+
+    for e in entries:
+        if isinstance(e, dict) and e.get("queueType") == "RANKED_SOLO_5x5":
+            lp = e.get("leaguePoints")
+            tier = e.get("tier")
+            try:
+                lp = int(lp)
+            except Exception:
+                lp = None
+            tier = str(tier).upper() if tier else None
+            return lp, tier
+
+    return None, None
+
+
+
+def _format_josh_nick(lp: int | None, tier: str | None) -> str:
+    # Exact format requested: "JOSH X/570 LP MASTER"
+    # If unranked/unknown, keep something sensible
+    if lp is None or tier is None:
+        return "JOSH —/580 LP UNRANKED"
+    return f"JOSH {lp}/580 LP {tier}"
+
 
 def _now_epoch() -> float:
     return time.time()  # (already defined above; leave your original)
@@ -3064,6 +3147,65 @@ def format_reply_chain_block(chain_msgs: list[discord.Message]) -> str:
 _ready_synced = False
 
 @tasks.loop(minutes=30)
+async def josh_soloq_lp_nickname_loop():
+    """
+    Every 30 minutes:
+      - fetch Josh SoloQ LP
+      - if LP changed since last check, update nickname in guild
+    """
+    api_key = os.getenv("RIOT_API_KEY")
+    if not api_key:
+        print("[JoshLP] RIOT_API_KEY not set; skipping.")
+        return
+
+    state = _load_josh_soloq_state()
+    last_lp = state.get("last_lp")
+    last_tier = state.get("last_tier")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            lp, tier = await _get_josh_soloq_lp_and_tier(session, api_key)
+
+        # Only update when LP changes (as requested).
+        # (If you also want tier changes to update, change this condition to: if lp != last_lp or tier != last_tier)
+        if lp == last_lp:
+            print(f"[JoshLP] No LP change (still {lp}).")
+            return
+
+        guild = bot.get_guild(JOSH_GUILD_ID)
+        if guild is None:
+            guild = await bot.fetch_guild(JOSH_GUILD_ID)
+
+        member = guild.get_member(JOSH_USER_ID)
+        if member is None:
+            member = await guild.fetch_member(JOSH_USER_ID)
+
+        new_nick = _format_josh_nick(lp, tier)
+
+        # Avoid unnecessary edit if nick already matches
+        if member.nick == new_nick:
+            _save_josh_soloq_state(lp, tier)
+            print(f"[JoshLP] Nick already '{new_nick}', state updated.")
+            return
+
+        await member.edit(nick=new_nick, reason="Josh SoloQ LP update")
+        _save_josh_soloq_state(lp, tier)
+        print(f"[JoshLP] Updated nick -> {new_nick} (was LP={last_lp}, now LP={lp})")
+
+    except discord.Forbidden:
+        print("[JoshLP] Forbidden: Bot lacks permission / role hierarchy to change nickname.")
+    except discord.HTTPException as e:
+        print(f"[JoshLP] Discord HTTPException: {e}")
+    except Exception as e:
+        print(f"[JoshLP] Error in loop: {e}")
+
+
+@josh_soloq_lp_nickname_loop.before_loop
+async def _before_josh_soloq_lp_nickname_loop():
+    await bot.wait_until_ready()
+
+
+@tasks.loop(minutes=30)
 async def opgg_cache_refresh_loop():
     # Best-effort periodic refresh of OP.GG cache, then update any persistent leaderboard posts demostrar.
     await refresh_opgg_flex_cache_best_effort(reason="loop_30m")
@@ -3093,6 +3235,9 @@ async def on_ready():
 
     if not opgg_cache_refresh_loop.is_running():
         opgg_cache_refresh_loop.start()
+
+    if not josh_soloq_lp_nickname_loop.is_running():
+        josh_soloq_lp_nickname_loop.start()
     
 
     guild_ids = [
