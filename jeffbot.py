@@ -33,6 +33,8 @@ _opgg_refresh_lock = asyncio.Lock()
 client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 
+RGAPIfe4_riotapikey = "-fe410e17-b1bc-41e4-99b6-6e5116bfee90"
+
 # The ID of the user whose messages you want to collect
 TARGET_USER_ID = 184481785172721665  # e.g., 123456789012345678
 
@@ -3146,7 +3148,7 @@ def format_reply_chain_block(chain_msgs: list[discord.Message]) -> str:
 
 _ready_synced = False
 
-@tasks.loop(minutes=30)
+@tasks.loop(minutes=3)
 async def josh_soloq_lp_nickname_loop():
     """
     Every 30 minutes:
