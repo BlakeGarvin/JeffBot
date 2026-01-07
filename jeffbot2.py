@@ -3177,11 +3177,8 @@ SPECTATE_VOICE_CHANNEL_ID = 760820005226283018  # join/leave this voice channel 
 SPECTATE_TARGETS = [
     {"label": "DrkCloak#NA1", "game_name": "DrkCloak", "tag_line": "NA1"},
     {"label": "Schmort#bone", "game_name": "Schmort", "tag_line": "bone"},
-    {"label": "Aquanick#bbcsr", "game_name": "Aquanick", "tag_line": "bbcsr"},
-    {"label": "brionacc#deaf", "game_name": "brionacc", "tag_line": "deaf"},
-    {"label": "unchands#haha", "game_name": "unchands", "tag_line": "haha"},
-    {"label": "foxchar#9423", "game_name": "foxchar", "tag_line": "9423"},
-    {"label": "teacup#boop", "game_name": "teacup", "tag_line": "boop"},
+    {"label": "Cody#1414", "game_name": "Cody", "tag_line": "1414"},
+    {"label": "WhiteSwan#4242", "game_name": "WhiteSwan", "tag_line": "4242"},
 ]
 
 # account-v1 is regional routing
@@ -3611,22 +3608,17 @@ async def _start_spectate_session(target_label: str, platform: str, puuid: str, 
     print(f"[Spectate] Now spectating {target_label} (gameId={_spectate_state['game_id']}).")
     asyncio.create_task(_press_key_sequence_best_effort("OUT", delay_seconds=30))
     # ✅ Run screenshare in parallel and stop it when League exits
+    # ✅ Run screenshare in parallel (store handles so we can stop it later)
     stop_event = asyncio.Event()
     screenshare_task = asyncio.create_task(screenshare(stop_event))
 
-    try:
-        # Wait for League process to end without blocking event loop
-        await asyncio.to_thread(proc.wait)
-    finally:
-        # Signal screenshare to stop and wait for cleanup
-        stop_event = asyncio.Event()
-        screenshare_task = asyncio.create_task(screenshare(stop_event))
+    _spectate_state["screenshare_stop_event"] = stop_event
+    _spectate_state["screenshare_task"] = screenshare_task
 
-        _spectate_state["screenshare_stop_event"] = stop_event
-        _spectate_state["screenshare_task"] = screenshare_task
+    # IMPORTANT: do NOT wait on proc.wait() here; League often stays open on the post-game screen.
+    # auto_spectate_loop() will poll Riot's spectator API and call _stop_spectate_session() when the match ends.
+    return
 
-        # Return immediately so auto_spectate_loop can keep polling and can stop us when match ends
-        return
 
     print("[Spectate] League ended; screenshare stopped.")
 
@@ -3725,8 +3717,8 @@ async def auto_spectate_loop():
                 #   - gameType / gameMode
                 #
                 # Example: ONLY spectate SoloQ (420):
-                #   if game_info.get("gameQueueConfigId") != 420:
-                #       continue
+                if game_info.get("gameQueueConfigId") != 420:
+                    continue
                 #
                 # Example: ONLY spectate Flex (440):
                 #   if game_info.get("gameQueueConfigId") != 440:
