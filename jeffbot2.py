@@ -3170,7 +3170,7 @@ def format_reply_chain_block(chain_msgs: list[discord.Message]) -> str:
 #   Automating a user's personal Discord client ("self-bot") is not supported by Discord ToS,
 #   so this implementation intentionally does NOT attempt to control your personal account.
 
-SPECTATE_POLL_INTERVAL_MINUTES = 3
+SPECTATE_POLL_INTERVAL_MINUTES = 1
 SPECTATE_VOICE_CHANNEL_ID = 760820005226283018  # join/leave this voice channel when spectating
 
 # Riot IDs to watch (gameName#tagLine)
@@ -3402,28 +3402,30 @@ def _is_proc_running(proc) -> bool:
         return False
 
 
-def _stop_spectate_session():
+async def _stop_spectate_session():
+    await _stop_screenshare_best_effort()
+
     proc = _spectate_state.get("proc")
-    try:
-        if _is_proc_running(proc):
+    if proc and _is_proc_running(proc):
+        try:
             proc.terminate()
             try:
                 proc.wait(timeout=5)
             except Exception:
                 proc.kill()
-    except Exception as e:
-        print(f"[Spectate] Failed stopping League spectate: {type(e).__name__}: {e}")
+        except Exception as e:
+            print(f"[Spectate] Failed to terminate League: {type(e).__name__}: {e}")
 
     _spectate_state.update({
         "active": False,
-        "target_label": None,
+        "proc": None,
         "puuid": None,
         "platform": None,
-        "game_id": None,
         "platform_id": None,
-        "proc": None,
-        "pressed_tilde": False,
+        "game_id": None,
+        "target_label": None,
     })
+
 
 
 from playwright.sync_api import sync_playwright
@@ -3467,6 +3469,18 @@ async def screenshare(stop_event: asyncio.Event):
                 "--enable-usermedia-screen-capturing",
                 # If Chromium is ignoring your auto-select source, you can keep it or remove it.
                 "--auto-select-desktop-capture-source=League of Legends (TM) Client",
+                "--start-minimized",                 # 👈 start minimized
+                "--disable-infobars",
+                "--disable-notifications",
+                "--disable-extensions",
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding",
+                "--disable-features=TranslateUI",
+                "--autoplay-policy=no-user-gesture-required",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-blink-features=AutomationControlled",
             ],
         )
 
@@ -3605,15 +3619,35 @@ async def _start_spectate_session(target_label: str, platform: str, puuid: str, 
         await asyncio.to_thread(proc.wait)
     finally:
         # Signal screenshare to stop and wait for cleanup
-        stop_event.set()
-        screenshare_task.cancel()
-        try:
-            await screenshare_task
-        except asyncio.CancelledError:
-            pass
+        stop_event = asyncio.Event()
+        screenshare_task = asyncio.create_task(screenshare(stop_event))
+
+        _spectate_state["screenshare_stop_event"] = stop_event
+        _spectate_state["screenshare_task"] = screenshare_task
+
+        # Return immediately so auto_spectate_loop can keep polling and can stop us when match ends
+        return
 
     print("[Spectate] League ended; screenshare stopped.")
 
+async def _stop_screenshare_best_effort():
+    stop_event = _spectate_state.get("screenshare_stop_event")
+    task = _spectate_state.get("screenshare_task")
+
+    if stop_event and not stop_event.is_set():
+        stop_event.set()
+
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"[Screenshare] Error stopping screenshare: {type(e).__name__}: {e}")
+
+    _spectate_state["screenshare_stop_event"] = None
+    _spectate_state["screenshare_task"] = None
 
 
 @tasks.loop(minutes=SPECTATE_POLL_INTERVAL_MINUTES)
@@ -3643,12 +3677,21 @@ async def auto_spectate_loop():
 
                 in_game, _info = await _spectate_check_active_game(session, api_key, platform, puuid)
 
+                current_game_id = _spectate_state.get("game_id")
+                new_game_id = (_info or {}).get("gameId")
+
                 if in_game and _is_proc_running(_spectate_state.get("proc")):
-                    return  # keep spectating
+                    # If they started a NEW game, restart spectator with new args
+                    if new_game_id and current_game_id and new_game_id != current_game_id:
+                        print(f"[Spectate] {label} started a new game (old={current_game_id}, new={new_game_id}); restarting spectator.")
+                        await _stop_spectate_session()
+                        await _start_spectate_session(label, platform, puuid, _info)
+                    return
+
 
                 # Out of game (or League proc died)
                 print(f"[Spectate] {label} is no longer in game; stopping spectate.")
-                _stop_spectate_session()
+                await _stop_spectate_session()
                 await _leave_voice_if_joined()
                 return
 
