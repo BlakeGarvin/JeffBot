@@ -27,13 +27,14 @@ from playwright.async_api import async_playwright
 import tiktoken
 import re
 import random
+import ssl
+import certifi
 
 load_dotenv()
 _opgg_refresh_lock = asyncio.Lock()
 client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 
-RGAPIfe4_riotapikey = "-fe410e17-b1bc-41e4-99b6-6e5116bfee90"
 
 # The ID of the user whose messages you want to collect
 TARGET_USER_ID = 184481785172721665  # e.g., 123456789012345678
@@ -624,7 +625,8 @@ def normalize_visible_ats(text: str) -> str:
 async def _riot_get_json(session: aiohttp.ClientSession, url: str, api_key: str) -> dict:
     """Tiny helper that does a Riot GET with basic error handling."""
     headers = {"X-Riot-Token": api_key}
-    async with session.get(url, headers=headers) as resp:
+    _ssl = ssl.create_default_context(cafile=certifi.where())
+    async with session.get(url, headers=headers, ssl=_ssl) as resp:
         if resp.status != 200:
             text = await resp.text()
             raise RuntimeError(f"Riot API error {resp.status} for {url}: {text[:200]}")
