@@ -34,6 +34,9 @@ import shlex
 import ctypes
 import subprocess
 
+
+#$env:ENABLE_KEYSEQ_PRESS="1"
+
 load_dotenv()
 _opgg_refresh_lock = asyncio.Lock()
 client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -3313,33 +3316,45 @@ def _spectate_build_command(game_info: dict):
 
 
 
-async def _press_o_once_best_effort(delay_seconds: int = 120):
+async def _press_key_sequence_best_effort(
+    sequence: str = "OUT",
+    delay_seconds: int = 30,
+    inter_key_delay: float = 0.08,
+):
     """
-    Press the 'O' key once on Windows after a delay (best-effort).
+    Press a short key sequence (default: O U T) on Windows after a delay (best-effort).
 
-    - Disabled by default. Set ENABLE_O_PRESS=1 to enable.
+    - Disabled by default. Set ENABLE_KEYSEQ_PRESS=1 to enable.
     - Uses Windows keybd_event; if you're not on Windows, it no-ops.
     - Non-blocking (safe to await in asyncio code).
     """
-    if os.getenv("ENABLE_O_PRESS", "").strip().lower() not in ("1", "true", "yes"):
+    if os.getenv("ENABLE_KEYSEQ_PRESS", "").strip().lower() not in ("1", "true", "yes"):
         return
 
     if sys.platform != "win32":
         return
 
-    # ⏳ wait before pressing
+    # Wait for League to finish loading in
     await asyncio.sleep(delay_seconds)
 
     try:
-        VK_O = 0x4F  # Virtual-Key code for 'O'
         KEYEVENTF_KEYUP = 0x0002
 
-        ctypes.windll.user32.keybd_event(VK_O, 0, 0, 0)               # key down
-        ctypes.windll.user32.keybd_event(VK_O, 0, KEYEVENTF_KEYUP, 0) # key up
+        # Only allow A-Z (easy + safe)
+        seq = "".join([c for c in (sequence or "").upper() if "A" <= c <= "Z"])
+        if not seq:
+            return
 
-        print("[Spectate] Pressed 'O' key.")
+        for ch in seq:
+            vk = ord(ch)  # 'A'..'Z' virtual key codes match ASCII
+            ctypes.windll.user32.keybd_event(vk, 0, 0, 0)               # key down
+            ctypes.windll.user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0) # key up
+            await asyncio.sleep(inter_key_delay)
+
+        print(f"[Spectate] Pressed key sequence: {seq}")
     except Exception as e:
-        print(f"[Spectate] Failed to press 'O': {type(e).__name__}: {e}")
+        print(f"[Spectate] Failed to press key sequence: {type(e).__name__}: {e}")
+
 
 
 async def _ensure_voice_joined():
@@ -3580,7 +3595,7 @@ async def _start_spectate_session(target_label: str, platform: str, puuid: str, 
         "pressed_tilde": True,
     })
     print(f"[Spectate] Now spectating {target_label} (gameId={_spectate_state['game_id']}).")
-    asyncio.create_task(_press_o_once_best_effort())
+    asyncio.create_task(_press_key_sequence_best_effort("OUT", delay_seconds=30))
     # ✅ Run screenshare in parallel and stop it when League exits
     stop_event = asyncio.Event()
     screenshare_task = asyncio.create_task(screenshare(stop_event))
