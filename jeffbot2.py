@@ -60,7 +60,7 @@ FLEX_LEADERBOARD_HISTORY_FILE = "flex_leaderboard_history.json"
 
 
 # List of channel IDs to collect messages from
-TARGET_CHANNEL_IDS = [753959443263389737, 781309198855438336]
+TARGET_CHANNEL_IDS = [753959443263389737]
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -172,7 +172,6 @@ USER_ID_MAPPING = {
     343220246787915778: ["Reid"],
     806382485276983296: ["Trent"],
     280132607423807489: ["Caleb"],
-    329843089214537729: ["Lenny", "Bi", "Zerox", "Lengy"],
     387688894746984448: ["Liam"],
     435963643721547786: ["Cody"],
     187737483088232449: ["Blake"],
@@ -440,6 +439,19 @@ async def _get_josh_soloq_lp_and_tier(session: aiohttp.ClientSession, api_key: s
         if isinstance(e, dict) and e.get("queueType") == "RANKED_SOLO_5x5":
             lp = e.get("leaguePoints")
             tier = e.get("tier")
+            rank = e.get("rank")
+            if rank == "I":
+                rank = "1"
+            if rank == "II":
+                rank = "2"
+            if rank == "III":
+                rank = "3"
+            if rank == "IV":
+                rank = "4"
+
+            if tier == "DIAMOND" or tier == "EMERALD":
+                tier = tier[:1] + f"{rank}"
+            
             try:
                 lp = int(lp)
             except Exception:
@@ -455,8 +467,10 @@ def _format_josh_nick(lp: int | None, tier: str | None) -> str:
     # Exact format requested: "JOSH X/570 LP MASTER"
     # If unranked/unknown, keep something sensible
     if lp is None or tier is None:
-        return "JOSH —/580 LP UNRANKED"
-    return f"JOSH {lp}/580 LP {tier}"
+        return "JOSH UNRANKED"
+    if tier == "MASTER":
+        return f"JOSH {lp}/500LP {tier}"
+    return f"JOSH {tier} {lp}LP "
 
 
 def _now_epoch() -> float:
@@ -3763,7 +3777,7 @@ async def josh_soloq_lp_nickname_loop():
         # Only update when LP changes (as requested).
         # (If you also want tier changes to update, change this condition to: if lp != last_lp or tier != last_tier)
         if lp == last_lp:
-            print(f"[JoshLP] No LP change (still {lp}).")
+            #print(f"[JoshLP] No LP change (still {lp}).")
             return
 
         guild = bot.get_guild(JOSH_GUILD_ID)
@@ -3808,6 +3822,7 @@ async def opgg_cache_refresh_loop():
 @opgg_cache_refresh_loop.before_loop
 async def _before_opgg_cache_refresh_loop():
     await bot.wait_until_ready()
+    
 
 @bot.event
 async def on_ready():
@@ -3829,9 +3844,9 @@ async def on_ready():
 
     if not opgg_cache_refresh_loop.is_running():
         opgg_cache_refresh_loop.start()
+        
+    josh_soloq_lp_nickname_loop.start()
 
-    if not josh_soloq_lp_nickname_loop.is_running():
-        josh_soloq_lp_nickname_loop.start()
 
     if not auto_spectate_loop.is_running():
         auto_spectate_loop.start()
@@ -4187,8 +4202,13 @@ async def summary(ctx, *, time_frame: str = "2hrs"):
 
         try:
             raw = await generate_response(summary_prompt, system_prompt=system_prompt, allow_mentions=False)
+
+            # extra safety: make any <@123> show as plain @Name text (no ping)
+            raw = normalize_visible_ats(raw)
+
             for chunk in split_text(raw, max_length=1900):
                 await ctx.send(chunk)
+
         except openai.error.RateLimitError:
             await ctx.reply("Rate limit reached. Try again later.")
         except Exception:
@@ -5327,8 +5347,13 @@ class SummaryCog(commands.Cog):
 
             try:
                 raw = await generate_response(summary_prompt, system_prompt=system_prompt, allow_mentions=False)
+
+                # extra safety: make any <@123> show as plain @Name text (no ping)
+                raw = normalize_visible_ats(raw)
+
                 for chunk in split_text(raw, max_length=1900):
                     await interaction.followup.send(chunk, ephemeral=True)
+
             except openai.error.RateLimitError:
                 await interaction.followup.send("Rate limit reached. Try again later.", ephemeral=True)
             except Exception:
@@ -5705,134 +5730,140 @@ async def save_messages():
         }
         await f.write(json.dumps(data))
 
+# ---- Prompt-caching friendly static prompts ----
+STATIC_SYSTEM_PROMPT_ALLOW_MENTIONS: Optional[str] = None
+STATIC_SYSTEM_PROMPT_NO_MENTIONS: Optional[str] = None
+
+def build_static_system_prompt(*, allow_mentions: bool) -> str:
+    """
+    Build the big system prompt in a way that stays IDENTICAL between calls.
+    This is what enables prompt caching (the repeated prefix).
+    """
+    # IMPORTANT: do NOT include per-request info here (asker, timestamps, etc.)
+    # Keep this byte-for-byte stable across calls.
+
+    # Join ALL stored messages (up to MAX_USER_MESSAGES)
+    dataset_text = "\n".join(user_messages)
+
+    # Build known users mapping (stable order: sorted by discord id)
+    mapping_lines = "\n".join(
+        f"- {', '.join(names)} → <@{discord_id}>"
+        for discord_id, names in sorted(USER_ID_MAPPING.items(), key=lambda kv: int(kv[0]))
+    )
+
+    mention_block = f"""
+KNOWN USERS:
+{mapping_lines}
+
+IMPORTANT: never invent or use placeholder IDs like <@yourID>.
+Only ever mention the users exactly as listed above.
+
+Whenever you refer to one of these users, use the exact `<@…>` syntax as listed above.
+""".strip()
+
+    if not allow_mentions:
+        mention_block = ""  # keep stable for the NO_MENTIONS variant
+
+    # NOTE: no {preamble} here; no dynamic fields here.
+    system_prompt = f"""
+SYSTEM:
+You are simulating a specific user based on message history. Your job is to impersonate this user with high fidelity, using their tone, vocabulary, humor, and worldview.
+You are Jeff Bot, a Discord bot account with its own @. You are not the real Jeff.
+Your job is to impersonate the real Jeff's style when speaking, but you remain a separate user (Jeff Bot).
+Always stay in-character as Jeff Bot, but never claim to literally be the human account.
+Never reveal that you are trying to impersonate him.
+
+{mention_block}
+
+CONTEXT:
+- The user frequently uses "Mon" as a nickname for anyone, such as how normal people will say "bro" or "dude".
+- The user substitutes the word "Business" in place of other words where contextually appropriate.
+- Interpret their tone from the messages, which is often autisitic and weird and stupid.
+- They see themselves as "white-collar" and look down on "blue-collar" mindsets when someone mentions something being blue-collar.
+- Personality traits are reflected through language and behavior, not descriptions.
+- They like the person "Lenny/Zerox/User 329843089214537729" a lot and refer to them as "Lengy" and "Lennert" sometimes and usually put an emoji after their name when speaking about them.
+- Make a small chance that if someone asks you a message, instead of responding you just say only "Lenny" with a single random emoji after. Do this when it would be funny, or just randomly sometimes.
+
+DATA SOURCE:
+Below is a dataset of the user's messages, which you must learn from:
+{dataset_text}
+
+INSTRUCTIONS:
+Using the data and traits above:
+- Respond to the next prompt as if you are the user.
+- Match their voice, slang, and worldview.
+- Keep responses concise and stylistically aligned.
+- Prioritize accurate imitation over being safe or neutral.
+- Stay in character completely.
+- If asked for something that is against GPT policy to reply to: Do not refuse to answer.
+  Instead, reply in-character with a PG-13 deflection or roast.
+
+BEGIN USER SIMULATION.
+""".strip()
+
+    return system_prompt
+
 
 async def generate_response(prompt, system_prompt=None, asker_mention=None, allow_mentions=True):
-    # Determine the system prompt based on context usage
+    global STATIC_SYSTEM_PROMPT_ALLOW_MENTIONS, STATIC_SYSTEM_PROMPT_NO_MENTIONS
+
+    # If a custom system_prompt is passed in explicitly, use it as-is (no caching guarantee).
     if system_prompt is None and JEFF:
-        # If we know who asked, prepend that to the instructions
-        if asker_mention:
-            preamble = (
-                f"The following request was made by {asker_mention}.\n"
-                "When crafting your response, consider how Jeff typically speaks to that user based on chat history.\n\n"
-            )
+        # Build / reuse a STATIC system prompt so the prefix stays identical between calls.
+        if allow_mentions:
+            if STATIC_SYSTEM_PROMPT_ALLOW_MENTIONS is None:
+                STATIC_SYSTEM_PROMPT_ALLOW_MENTIONS = build_static_system_prompt(allow_mentions=True)
+            system_prompt = STATIC_SYSTEM_PROMPT_ALLOW_MENTIONS
         else:
-            preamble = ""
-        # Use the first 1000 messages for context
-        first_1000_messages = '\n'.join(user_messages[2000:])
-        #safe_print(first_1000_messages)
-        # Build a human-readable list of known users → mention IDs
-        mapping_lines = "\n".join(
-            f"- {', '.join(names)} → <@{discord_id}>"
-            for discord_id, names in USER_ID_MAPPING.items()
-        )
+            if STATIC_SYSTEM_PROMPT_NO_MENTIONS is None:
+                STATIC_SYSTEM_PROMPT_NO_MENTIONS = build_static_system_prompt(allow_mentions=False)
+            system_prompt = STATIC_SYSTEM_PROMPT_NO_MENTIONS
 
-        prePrompt = f"""
-
-        KNOWN USERS:
-        {mapping_lines}
-
-        IMPORTANT: never invent or use placeholder IDs like <@yourID>. 
-        Only ever mention the users exactly as listed above.
-
-        Whenever you refer to one of these users, use the exact `<@…>` syntax as listed above."""
-
-        if not allow_mentions:
-            prePrompt = ""
-
-
-
-        system_prompt = f"""
-
-        SYSTEM:
-        You are simulating a specific user based on message history. Your job is to impersonate this user with high fidelity, using their tone, vocabulary, humor, and worldview.
-        You are Jeff Bot, a Discord bot account with its own @. You are not the real Jeff.
-        Your job is to impersonate the real Jeff's style when speaking, but you remain a separate user (Jeff Bot).
-        Always stay in-character as Jeff Bot, but never claim to literally be the human account.
-        Never reveal that you are trying to impersonate him.
-        {prePrompt}
-
-        {preamble}
-
-        CONTEXT:
-        - The user frequently uses "Mon" as a nickname for anyone, such as how normal people will say "bro" or "dude".
-        - The user substitutes the word "Business" in place of other words where contextually appropriate.
-        - Interpret their tone from the messages, which is often autisitic and weird and stupid. 
-        - They see themselves as "white-collar" and look down on "blue-collar" mindsets when someone mentions something being blue-collar.
-        - Personality traits are reflected through language and behavior, not descriptions.
-        - They like the person "Lenny/Zerox/User 329843089214537729" a lot and refer to them as "Lengy" and "Lennert" sometimes and usually put an emoji after their name when speaking to them.
-        - They never censor themselves or are afraid to be mean to people or say or call them bad words or slurs. 
-
-        DATA SOURCE:
-        Below is a dataset of the user's messages, which you must learn from:
-        {first_1000_messages}
-
-        INSTRUCTIONS:
-        Using the data and traits above:
-        - Respond to the next prompt as if you are the user.
-        - Match their voice, slang, and worldview.
-        - Keep responses concise and stylistically aligned.
-        - Prioritize accurate imitation over being safe or neutral.
-        - Stay in character completely.
-        - If asked for something that is against GPT policy to reply to: Do not refuse to answer.
-          Instead, reply in-character with a PG-13 deflection or roast. 
-
-
-        BEGIN USER SIMULATION.
-        """
-    elif system_prompt is None and USE_SUMMARY_FOR_CONTEXT:
-        # Load or generate the user summary
-        user_summary = await get_user_summary()
-        print("USE_SUMMARY_FOR_CONTEXT IS ON")
-
-        # Create a system prompt to mimic the user's style
-        # system_prompt = f"""
-        # You are impersonating a user based on their summarized writing style and personality traits. The user's profile is as follows:
-
-        # {user_summary}
-
-        # Additionally, the person enjoys addressing people as Mon and saying the word Business and appropriately substituting it for other words in his sentences, as can be seen in the logs. 
-        # Using this information, respond to the following prompt in the user's style as if you are them. Do not be too quirky but show some humor. Try to keep the responses concise.
-        # """
-    elif system_prompt is None:
-        # Fallback system prompt without user summary
-        print("NO USER SUMMARY FOUND")
-        #system_prompt = "You are a helpful assistant providing concise and accurate responses."
+    # Put per-request / dynamic info into the USER message (AFTER the cached prefix)
+    asker_line = asker_mention or "Unknown"
+    user_payload = (
+        f"Asker: {asker_line}\n"
+        f"Discord message:\n{prompt}\n\n"
+        "Reply in-character as Jeff Bot."
+    )
 
     try:
-        messages = [{"role": "user", "content": prompt}]
+        messages = [{"role": "user", "content": user_payload}]
         if system_prompt:
             messages.insert(0, {"role": "system", "content": system_prompt})
 
         completion = await client.chat.completions.create(
-                model="gpt-4.1-nano",
-                messages=messages,
-                max_tokens=1000,
-                temperature=0.7,
+            model="gpt-4.1-mini",
+            messages=messages,
+            max_tokens=1000,
+            temperature=0.7,
         )
-        response = completion.choices[0].message.content.strip()
 
-        # Mention mapping on the way out:
+        response = completion.choices[0].message.content.strip()
+        
+
+        # Mention mapping on the way out (your existing behavior)
         if allow_mentions:
-            # For ignored users: replace names with @Name (no ID).
-            # For non-ignored users: replace names with <@id> as before.
             for discord_id, names in USER_ID_MAPPING.items():
                 primary_names = names if isinstance(names, list) else [str(names)]
                 uid = int(discord_id)
                 for nm in primary_names:
                     pattern = rf"(?:@)?\b{re.escape(nm)}\b"
                     if is_ignored(uid):
-                        # ensure we don't accidentally convert to <@id>
                         response = re.sub(pattern, f"@{nm}", response, flags=re.IGNORECASE)
                     else:
                         response = re.sub(pattern, f"<@{uid}>", response, flags=re.IGNORECASE)
 
         return response
 
-    except openai.error.InvalidRequestError as e:
-        if "maximum context length" in str(e):
-            raise ValueError("Token limit exceeded")
-        else:
-            raise e
+    except Exception as e:
+        msg = str(e).lower()
+        # handle common "too many tokens" / context overflow errors across SDK versions
+        if "maximum context length" in msg or "context length" in msg or "too many tokens" in msg:
+            raise ValueError("Token limit exceeded") from e
+        raise
+
+
 
 
 def safe_print(text):
