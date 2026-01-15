@@ -5743,7 +5743,7 @@ def build_static_system_prompt(*, allow_mentions: bool) -> str:
     # Keep this byte-for-byte stable across calls.
 
     # Join ALL stored messages (up to MAX_USER_MESSAGES)
-    dataset_text = "\n".join(user_messages)
+    dataset_text = "\n".join(user_messages[3000:])
 
     # Build known users mapping (stable order: sorted by discord id)
     mapping_lines = "\n".join(
