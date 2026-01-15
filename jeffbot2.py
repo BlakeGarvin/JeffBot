@@ -11,6 +11,16 @@ import math
 import random
 import copy
 import secrets, string
+import shutil
+import tiktoken
+import re
+import random
+import ssl
+import certifi
+import subprocess
+import shlex
+import ctypes
+import subprocess
 from dotenv import load_dotenv
 from discord.ext import commands, tasks
 from discord import ButtonStyle, app_commands, Interaction
@@ -24,15 +34,9 @@ from flask import Flask, request
 from flask_cors import CORS
 from threading import Thread
 from playwright.async_api import async_playwright
-import tiktoken
-import re
-import random
-import ssl
-import certifi
-import subprocess
-import shlex
-import ctypes
-import subprocess
+from pathlib import Path
+from urllib.parse import urlparse
+
 
 
 #$env:ENABLE_KEYSEQ_PRESS="1"
@@ -70,6 +74,13 @@ SUMMARY_FILE = os.path.join(SCRIPT_DIR, 'user_summary.txt')
 BALANCES_FILE = os.path.join(SCRIPT_DIR, 'user_balances.json')
 DAILY_COOLDOWN_FILE = os.path.join(SCRIPT_DIR, 'daily_cooldowns.json')
 FLEX_RANK_SNAPSHOTS_FILE = os.path.join(SCRIPT_DIR, "flex_rank_snapshots.json")
+
+TMP_DIR = Path("./tmp")
+TMP_DIR.mkdir(exist_ok=True)
+
+KLIPY_APP_KEY = os.getenv("KLIPY_APP_KEY")  # put this in .env
+KLIPY_CUSTOMER_ID = os.environ.get("KLIPY_CUSTOMER_ID", "discordbot")
+KLIPY_LOCALE = os.environ.get("KLIPY_LOCALE", "us")
 
 # Persistent Flex leaderboard message pointers (so the bot can edit 1 message instead of spamming new ones)
 FLEX_PERSISTENT_MESSAGES_FILE = os.path.join(SCRIPT_DIR, "flex_persistent_messages.json")
@@ -3167,7 +3178,283 @@ def format_reply_chain_block(chain_msgs: list[discord.Message]) -> str:
         lines.append(f"[{m.author.display_name}] {MENTION_SEP} {content}")
     return format_block(f"REPLY_CHAIN_LEN_{len(lines)}", lines)
 
+# LENNY GIFS
 
+def looks_like_url(s: str) -> bool:
+    try:
+        u = urlparse(s)
+        return u.scheme in ("http", "https") and bool(u.netloc)
+    except Exception:
+        return False
+
+def collect_urls(obj) -> list[str]:
+    urls = []
+    if isinstance(obj, dict):
+        for v in obj.values():
+            urls.extend(collect_urls(v))
+    elif isinstance(obj, list):
+        for v in obj:
+            urls.extend(collect_urls(v))
+    elif isinstance(obj, str):
+        if looks_like_url(obj):
+            urls.append(obj)
+    return urls
+
+def pick_best_media_url(urls: list[str]) -> str | None:
+    if not urls:
+        return None
+
+    def score(u: str) -> int:
+        ul = u.lower()
+        if ul.endswith(".mp4"):
+            return 300
+        if ul.endswith(".webm"):
+            return 250
+        if ul.endswith(".gif"):
+            return 200
+        if "mp4" in ul:
+            return 180
+        if "webm" in ul:
+            return 160
+        if "gif" in ul:
+            return 140
+        return 10
+
+    urls_sorted = sorted(set(urls), key=score, reverse=True)
+    best = urls_sorted[0]
+    if score(best) <= 10:
+        return None
+    return best
+
+def find_ffmpeg() -> str | None:
+    p = os.environ.get("FFMPEG_PATH")
+    if p and Path(p).exists():
+        return p
+
+    p = shutil.which("ffmpeg")
+    if p:
+        return p
+
+    if sys.platform.startswith("win"):
+        try:
+            out = subprocess.check_output(["where.exe", "ffmpeg"], text=True).strip()
+            if out:
+                first = out.splitlines()[0].strip()
+                if Path(first).exists():
+                    return first
+        except Exception:
+            pass
+
+    return None
+
+FFMPEG = find_ffmpeg()
+if not FFMPEG:
+    raise FileNotFoundError(
+        "ffmpeg not found. Install FFmpeg and ensure ffmpeg.exe is on PATH, "
+        "or set environment variable FFMPEG_PATH to the full path of ffmpeg.exe."
+    )
+
+def run_ffmpeg(cmd: list[str]) -> None:
+    if cmd and cmd[0] == "ffmpeg":
+        cmd = [FFMPEG] + cmd[1:]
+
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr[-3000:])
+
+async def klipy_pick_random_media_url() -> str:
+    if not KLIPY_APP_KEY:
+        raise RuntimeError("KLIPY_APP_KEY is not set. Add it to your .env")
+
+    base = f"https://api.klipy.com/api/v1/{KLIPY_APP_KEY}/gifs/trending"
+    params = {
+        "page": 1,
+        "per_page": 50,
+        "customer_id": KLIPY_CUSTOMER_ID,
+        "locale": KLIPY_LOCALE,
+        "format_filter": "mp4,gif,webm",
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(base, params=params, timeout=30) as resp:
+            resp.raise_for_status()
+            payload = await resp.json()
+
+    # Optional debugging:
+    (TMP_DIR / "klipy_debug.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    urls = collect_urls(payload)
+    random.shuffle(urls)
+
+    best = pick_best_media_url(urls)
+    if not best:
+        raise RuntimeError("No usable media URL found in KLIPY response (see tmp/klipy_debug.json).")
+    return best
+
+async def download_file(url: str, out_path: Path) -> None:
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, timeout=60) as resp:
+            resp.raise_for_status()
+            out_path.write_bytes(await resp.read())
+
+def render_lenny(
+    input_media: Path,
+    output_gif: Path,
+    *,
+    width: int = 360,
+    fps: int = 12,
+    seconds: int = 5
+) -> None:
+    rnd = random.Random(random.randint(0, 999999))
+
+    fonts_dir = Path(r"C:\Windows\Fonts")
+    all_fonts = list(fonts_dir.glob("*.ttf")) + list(fonts_dir.glob("*.otf"))
+
+    funky_keywords = [
+        "impact", "comic", "papyrus", "brush", "script", "cooper", "chiller",
+        "jokerman", "harrington", "broadway", "showcard", "stencil", "rockwell",
+        "ravie", "curlz", "alger", "gigi", "agency"
+    ]
+
+    funky, normal = [], []
+    for f in all_fonts:
+        n = f.name.lower()
+        (funky if any(k in n for k in funky_keywords) else normal).append(f)
+
+    pick_pool = funky if (funky and rnd.random() < 0.70) else (all_fonts if all_fonts else [])
+    fontfile = str(rnd.choice(pick_pool)) if pick_pool else None
+
+    def ffmpeg_font_path(p: str) -> str:
+        p = p.replace("\\", "/")
+        if len(p) > 1 and p[1] == ":":
+            p = p[0] + r"\:/" + p[3:]
+        return p
+
+    size_frac = rnd.uniform(0.09, 0.17)
+    fontsize = f"max(22\\,h*{size_frac:.4f})"
+
+    borderw = rnd.randint(4, 12)
+    shadowx = rnd.randint(1, 4)
+    shadowy = rnd.randint(1, 4)
+
+    LIGHT_TEXT = [
+        "white", "yellow", "lime", "cyan", "magenta", "orange",
+        "#00FFFF", "#FF00FF", "#FFFF00", "#FFFFFF", "#B6FF00", "#FFB000",
+        "#FFD1DC", "#C8FFFF", "#E6FFB3"
+    ]
+    DARK_TEXT = ["#111111", "#1A1A1A", "#202020", "#2B2B2B", "#0B1B3A", "#2A0033"]
+    DARK_OUTLINE = ["black", "#000000", "#0A0A0A", "#111111", "#1A1A1A"]
+    LIGHT_OUTLINE = ["white", "#FFFFFF", "#F2F2F2", "#E8E8E8"]
+
+    text_is_light = rnd.random() < 0.85
+    fontcolor = rnd.choice(LIGHT_TEXT if text_is_light else DARK_TEXT)
+    bordercolor = rnd.choice(DARK_OUTLINE if text_is_light else LIGHT_OUTLINE)
+    shadowcolor = (rnd.choice(DARK_OUTLINE) + "@0.65") if text_is_light else (rnd.choice(LIGHT_OUTLINE) + "@0.55")
+
+    if rnd.random() < 0.20:
+        if text_is_light:
+            bordercolor = rnd.choice(DARK_OUTLINE + ["#001019", "#160016", "#1B0B00"])
+        else:
+            bordercolor = rnd.choice(LIGHT_OUTLINE + ["#FFFFAA", "#CCFFFF", "#FFCCFF"])
+
+    mode = "sporadic" if rnd.random() < 0.40 else "drift"
+    mx = rnd.uniform(0.05, 0.18)
+    my = rnd.uniform(0.05, 0.18)
+
+    t0 = rnd.uniform(0, 50.0)
+    tt = f"(t+{t0:.4f})"
+
+    if mode == "drift":
+        fx1, fx2 = rnd.uniform(0.12, 0.35), rnd.uniform(0.20, 0.55)
+        fy1, fy2 = rnd.uniform(0.12, 0.35), rnd.uniform(0.20, 0.55)
+        ax1, ax2 = rnd.uniform(0.10, 0.22), rnd.uniform(0.04, 0.12)
+        ay1, ay2 = rnd.uniform(0.10, 0.22), rnd.uniform(0.04, 0.12)
+    else:
+        fx1, fx2 = rnd.uniform(0.50, 1.20), rnd.uniform(0.90, 2.00)
+        fy1, fy2 = rnd.uniform(0.50, 1.20), rnd.uniform(0.90, 2.00)
+        ax1, ax2 = rnd.uniform(0.14, 0.32), rnd.uniform(0.08, 0.20)
+        ay1, ay2 = rnd.uniform(0.14, 0.32), rnd.uniform(0.08, 0.20)
+
+    px1, px2 = rnd.uniform(0, 6.283), rnd.uniform(0, 6.283)
+    py1, py2 = rnd.uniform(0, 6.283), rnd.uniform(0, 6.283)
+
+    frac_x = (
+        f"(0.5"
+        f"+{ax1:.4f}*sin({fx1:.4f}*{tt}+{px1:.4f})"
+        f"+{ax2:.4f}*sin({fx2:.4f}*{tt}+{px2:.4f}))"
+    )
+    frac_y = (
+        f"(0.5"
+        f"+{ay1:.4f}*cos({fy1:.4f}*{tt}+{py1:.4f})"
+        f"+{ay2:.4f}*cos({fy2:.4f}*{tt}+{py2:.4f}))"
+    )
+
+    x_expr = f"{mx:.4f}*w+(w-text_w-2*{mx:.4f}*w)*{frac_x}"
+    y_expr = f"{my:.4f}*h+(h-text_h-2*{my:.4f}*h)*{frac_y}"
+
+    drawtext_parts = [
+        "drawtext=text=Lenny",
+        f"fontsize={fontsize}",
+        f"fontcolor={fontcolor}",
+        f"borderw={borderw}",
+        f"bordercolor={bordercolor}",
+        f"shadowx={shadowx}",
+        f"shadowy={shadowy}",
+        f"shadowcolor={shadowcolor}",
+        f"x={x_expr}",
+        f"y={y_expr}",
+    ]
+    if fontfile:
+        drawtext_parts.insert(1, f"fontfile='{ffmpeg_font_path(fontfile)}'")
+
+    drawtext = ":".join(drawtext_parts)
+
+    vf = (
+        f"fps={fps},scale={width}:-1:flags=lanczos,"
+        f"{drawtext},"
+        "split[s0][s1];"
+        "[s0]palettegen=stats_mode=single[p];"
+        "[s1][p]paletteuse=dither=bayer:bayer_scale=3"
+    )
+
+    run_ffmpeg([
+        "ffmpeg", "-y",
+        "-i", str(input_media),
+        "-t", str(seconds),
+        "-an",
+        "-filter_complex", vf,
+        str(output_gif)
+    ])
+
+def render_under_limit(input_media: Path, output_gif: Path, max_bytes: int = 7_500_000) -> None:
+    attempts = [
+        dict(width=420, fps=15, seconds=6),
+        dict(width=360, fps=12, seconds=5),
+        dict(width=320, fps=12, seconds=5),
+        dict(width=280, fps=10, seconds=5),
+        dict(width=240, fps=10, seconds=4),
+    ]
+    for settings in attempts:
+        render_lenny(input_media, output_gif, **settings)
+        if output_gif.stat().st_size <= max_bytes:
+            return
+    raise RuntimeError(f"Could not shrink GIF under {max_bytes/1_000_000:.1f}MB")
+
+async def generate_lenny_gif_unique(tag: str) -> Path:
+    media_url = await klipy_pick_random_media_url()
+
+    src = TMP_DIR / f"input_media_{tag}"
+    out = TMP_DIR / f"lenny_{tag}.gif"
+
+    await download_file(media_url, src)
+    render_under_limit(src, out)
+
+    try:
+        src.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    return out
 
 # ============================================================
 # Auto-spectate + Voice-channel presence (every 3 minutes)
@@ -3919,9 +4206,32 @@ async def on_message(message: discord.Message):
             except Exception:
                 pass
 
-    # Special user “Lenny” response (kept)
-    if message.author.id == SPECIAL_USER_ID and random.randint(1, SPECIAL_USER_RESPONSE_CHANCE) == 2:
-        await message.reply(SPECIAL_USER_RESPONSE)
+        # Special user (Lenny) reply logic:
+        if message.author.id == SPECIAL_USER_ID:
+            # 1/200 chance: reply with a generated gif
+            if random.randint(1, 200) == 1:
+                try:
+                    async with message.channel.typing():
+                        tag = str(message.id)
+                        gif_path = await generate_lenny_gif_unique(tag)
+                        await message.reply(file=discord.File(str(gif_path)))
+                except Exception:
+                    # If gif fails, silently fall back to text
+                    try:
+                        await message.reply("Lenny")
+                    except Exception:
+                        pass
+                finally:
+                    try:
+                        if 'gif_path' in locals():
+                            Path(gif_path).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+            # otherwise: your normal "chance to reply 'Lenny'"
+            elif random.randint(1, SPECIAL_USER_RESPONSE_CHANCE) == 2:
+                await message.reply("Lenny")
+
 
     # Prefix command? let commands extension handle it
     if message.content.startswith(bot.command_prefix):
@@ -4979,6 +5289,27 @@ class GeneralCog(commands.Cog):
         # Manual mode: post to the channel where the slash command was used
         await interaction.followup.send(msg)
 
+    @app_commands.command(
+        name="lennygif",
+        description="Post a random Lenny motion-tracked gif in this channel."
+    )
+    async def lennygif(self, interaction: discord.Interaction):
+        await interaction.response.defer(thinking=True)
+        try:
+            tag = str(interaction.id)
+            gif_path = await generate_lenny_gif_unique(tag)
+            await interaction.followup.send(file=discord.File(str(gif_path)))
+        except Exception as e:
+            await interaction.followup.send(f"❌ Failed to make gif: {type(e).__name__}: {e}")
+        finally:
+            # cleanup
+            try:
+                if 'gif_path' in locals():
+                    Path(gif_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
     # -------------------------------
     # OP.GG cache refresher
     # -------------------------------
@@ -5743,7 +6074,7 @@ def build_static_system_prompt(*, allow_mentions: bool) -> str:
     # Keep this byte-for-byte stable across calls.
 
     # Join ALL stored messages (up to MAX_USER_MESSAGES)
-    dataset_text = "\n".join(user_messages[3000:])
+    dataset_text = "\n".join(user_messages[4000:])
 
     # Build known users mapping (stable order: sorted by discord id)
     mapping_lines = "\n".join(
@@ -5796,7 +6127,7 @@ Using the data and traits above:
 - Prioritize accurate imitation over being safe or neutral.
 - Stay in character completely.
 - If asked for something that is against GPT policy to reply to: Do not refuse to answer.
-  Instead, reply in-character with a PG-13 deflection or roast.
+  Instead, reply with something about Lenny. 
 
 BEGIN USER SIMULATION.
 """.strip()

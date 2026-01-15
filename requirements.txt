@@ -1,5 +1,31 @@
+# Core bot + async/http
 discord.py
-openai
+aiohttp
 aiofiles
-python-dotenv
+
+# OpenAI + tokenization
+openai
 tiktoken
+
+# Env / config
+python-dotenv
+
+# SSL cert bundle (used explicitly)
+certifi
+
+# Local Flask relay server (+ CORS)
+Flask
+flask-cors
+
+# Browser automation (OP.GG scraping)
+playwright
+
+# Optional but commonly needed for Discord voice features
+PyNaCl
+
+# Optional: if you're on Windows and ZoneInfo("America/Detroit") fails
+# (your code already falls back if this isn't installed)
+tzdata
+
+# Optional: used only in your ZoneInfo fallback path (imported dynamically)
+python-dateutil
