@@ -21,6 +21,7 @@ import subprocess
 import shlex
 import ctypes
 import subprocess
+from dataclasses import dataclass, field
 from dotenv import load_dotenv
 from discord.ext import commands, tasks
 from discord import ButtonStyle, app_commands, Interaction
@@ -37,6 +38,701 @@ from playwright.async_api import async_playwright
 from pathlib import Path
 from urllib.parse import urlparse
 
+
+# ============================================================================
+# Prediction system (Riot spectator -> poll -> match-v5 result -> leaderboard)
+#
+# Notes:
+# - Uses the SAME Riot API method as your standalone script:
+#   account-v1 by-riot-id -> summoner-v4 probe to find platform -> spectator-v5
+#   active game -> match-v5 result by matchId.
+# - Dedupe: only ONE poll per match, even if multiple tracked accounts are in it.
+# - Queue logic:
+#     * Flex (440): "Ranked Flex". Poll lists all tracked players from FLEX_PROFILES
+#       found in the match.
+#     * Solo (420): "SoloQ". If >=2 tracked players are on the same team, display
+#       "DuoQ" and list both.
+# - Leaderboard: local JSON file, net score = correct - wrong,
+#   accuracy = correct/(correct+wrong).
+#   Command: /prediction_leaderboard
+# ============================================================================
+
+# Defaults are chosen to match riot_discord_predictor.py
+_PREDICTION_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# If env var is not set, we will fall back to FLEX_LEADERBOARD_CHANNEL_ID once it is defined later in this file.
+PREDICTION_CHANNEL_ID = int(os.getenv("PREDICTION_CHANNEL_ID", "0"))
+PREDICTION_POLL_INTERVAL_SECONDS = int(os.getenv("PREDICTION_POLL_INTERVAL_SECONDS", "20"))
+PREDICTION_VOTING_CLOSE_AFTER_SECONDS = int(os.getenv("PREDICTION_VOTING_CLOSE_AFTER_SECONDS", "90"))
+PREDICTION_DELETE_AFTER_SECONDS = int(os.getenv("PREDICTION_DELETE_AFTER_SECONDS", "300"))
+PREDICTION_REMAKE_THRESHOLD_SECONDS = int(os.getenv("PREDICTION_REMAKE_THRESHOLD_SECONDS", "300"))
+PREDICTION_RESULT_TIMEOUT_SECONDS = int(os.getenv("PREDICTION_RESULT_TIMEOUT_SECONDS", "600"))
+PREDICTION_SCORES_FILE = os.getenv("PREDICTION_SCORES_FILE", os.path.join(_PREDICTION_BASE_DIR, "prediction_scores.json"))
+
+_PRED_PLATFORM_TO_REGION = {
+    # Americas
+    "na1": "americas", "br1": "americas", "la1": "americas", "la2": "americas", "oc1": "americas",
+    # Europe
+    "euw1": "europe", "eun1": "europe", "tr1": "europe", "ru": "europe",
+    # Asia
+    "kr": "asia", "jp1": "asia", "ph2": "asia", "sg2": "asia", "th2": "asia", "tw2": "asia", "vn2": "asia",
+}
+
+
+def _prediction_match_region_for_platform(platform: str) -> str:
+    region = _PRED_PLATFORM_TO_REGION.get((platform or "").lower())
+    if not region:
+        # Default to americas (your flex profiles are NA); but keep it explicit.
+        return "americas"
+    return region
+
+
+def _prediction_make_match_id(platform_id: str, game_id: int) -> str:
+    return f"{platform_id.upper()}_{int(game_id)}"
+
+
+def _prediction_fmt_team(team_id: int) -> str:
+    return "BLUE" if team_id == 100 else "RED" if team_id == 200 else str(team_id)
+
+
+def _prediction_fmt_ts_discord(unix_seconds: int) -> str:
+    return f"<t:{int(unix_seconds)}:R>"
+
+
+def _prediction_load_scores() -> dict:
+    base = {"version": 1, "users": {}}  # users: {str(user_id): {name, correct, wrong}}
+    try:
+        if not os.path.exists(PREDICTION_SCORES_FILE):
+            return base
+        with open(PREDICTION_SCORES_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f) or {}
+        if isinstance(raw, dict) and "users" in raw:
+            return raw
+        # Back-compat if you ever stored flat dict
+        if isinstance(raw, dict):
+            return {"version": 1, "users": raw}
+        return base
+    except Exception:
+        return base
+
+
+def _prediction_save_scores(data: dict) -> None:
+    try:
+        with open(PREDICTION_SCORES_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+    except Exception as e:
+        print(f"[Predict] Error saving scores: {e}")
+
+
+def _prediction_upsert_user(scores_data: dict, user: discord.abc.User) -> dict:
+    users = scores_data.setdefault("users", {})
+    uid = str(user.id)
+    entry = users.get(uid) or {"name": user.display_name, "correct": 0, "wrong": 0}
+    entry["name"] = user.display_name
+    entry["correct"] = int(entry.get("correct", 0))
+    entry["wrong"] = int(entry.get("wrong", 0))
+    users[uid] = entry
+    return entry
+
+
+def _prediction_embed_for_match(
+    title_line: str,
+    team_id: int,
+    game_start_ms: int,
+    voting_open: bool,
+    voting_closed_at_ms: int | None,
+    win_votes: int,
+    lose_votes: int,
+    tracked_names: list[str],
+) -> discord.Embed:
+    start_unix = int(game_start_ms // 1000)
+    if voting_open:
+        vote_line = "Voting open."
+    else:
+        closed_unix = int((voting_closed_at_ms // 1000) if voting_closed_at_ms else start_unix)
+        vote_line = f"Voting closed {_prediction_fmt_ts_discord(closed_unix)}."
+
+    roster = ", ".join(tracked_names) if tracked_names else "(none)"
+    desc = (
+        f"**Prediction time!** {title_line}\n"
+        f"Tracked in match: **{roster}**\n"
+        f"Team: **{_prediction_fmt_team(team_id)}**\n\n"
+        f"Match started {_prediction_fmt_ts_discord(start_unix)}\n"
+        f"{vote_line}\n\n"
+        f"Current votes: ✅ WIN **{win_votes}** | ❌ LOSE **{lose_votes}**"
+    )
+    return discord.Embed(description=desc)
+
+
+def _prediction_result_embed(
+    title_line: str,
+    team_id: int,
+    win: bool,
+    correct_mentions: list[str],
+    incorrect_mentions: list[str],
+    tracked_names: list[str],
+) -> discord.Embed:
+    roster = ", ".join(tracked_names) if tracked_names else "(none)"
+    result_line = f"**{title_line}** on **{_prediction_fmt_team(team_id)}** **{'WON ✅' if win else 'LOST ❌'}**"
+    e = discord.Embed(description=f"{result_line}\n\nTracked in match: **{roster}**")
+    e.add_field(
+        name="Who was right (+1)",
+        value="\n".join(correct_mentions) if correct_mentions else "Nobody 😅",
+        inline=True,
+    )
+    e.add_field(
+        name="Who was wrong (-1)",
+        value="\n".join(incorrect_mentions) if incorrect_mentions else "Nobody 🎉",
+        inline=True,
+    )
+    return e
+
+
+class PredictionView(discord.ui.View):
+    """Per-match view (not persistent across restarts)."""
+
+    def __init__(self, cog: "PredictionCog", match_id: str):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.match_id = match_id
+
+    @discord.ui.button(label="WIN", style=discord.ButtonStyle.success)
+    async def predict_win(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog.handle_vote(interaction, self.match_id, "WIN")
+
+    @discord.ui.button(label="LOSE", style=discord.ButtonStyle.danger)
+    async def predict_lose(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog.handle_vote(interaction, self.match_id, "LOSE")
+
+
+@dataclass
+class PredictionSession:
+    match_id: str
+    platform: str
+    region: str
+    platform_id: str
+    game_id: int
+    queue_id: int
+    title_line: str
+    tracked: list[dict]  # [{name, puuid, teamId}]
+    team_id: int
+    game_start_time_ms: int
+
+    channel_id: int
+    message_id: int | None = None
+
+    votes: dict[int, str] = field(default_factory=dict)  # discord user id -> "WIN"/"LOSE"
+    voting_open: bool = True
+    voting_closed_at_ms: int | None = None
+
+    result_posted: bool = False
+    created_at_ms: int = field(default_factory=lambda: int(time.time() * 1000))
+
+
+class PredictionCog(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+
+        # Resolve destination channel at runtime (FLEX_LEADERBOARD_CHANNEL_ID is defined later in the file).
+        fallback_channel = globals().get("FLEX_LEADERBOARD_CHANNEL_ID") or 0
+        self._channel_id = int(PREDICTION_CHANNEL_ID or fallback_channel or 0)
+        if self._channel_id == 0:
+            print("[Predict] WARNING: No prediction channel set. Set PREDICTION_CHANNEL_ID env var.")
+
+        # Cache Riot identity resolution so we don't probe every loop.
+        # key = f"{game_name}#{tag}" lower
+        self._identity_cache: dict[str, dict] = {}
+
+        # Active sessions keyed by match_id
+        self._sessions: dict[str, PredictionSession] = {}
+
+        # Recent matches we've already created sessions for (prevents spam if message deleted)
+        self._recent_seen: dict[str, float] = {}
+
+        # Persistent user scoring
+        self._scores = _prediction_load_scores()
+        self._scores_lock = asyncio.Lock()
+
+        # Start poll loop
+        self.prediction_poll_loop.start()
+
+    # -----------------------------
+    # Riot API helpers (same method as predictor)
+    # -----------------------------
+
+    def _cache_key(self, game_name: str, tag_line: str) -> str:
+        return f"{game_name}#{tag_line}".lower()
+
+    async def _resolve_identity(self, session: aiohttp.ClientSession, api_key: str, game_name: str, tag_line: str) -> dict:
+        key = self._cache_key(game_name, tag_line)
+        cached = self._identity_cache.get(key)
+        if cached:
+            return cached
+        puuid = await _spectate_get_puuid(session, api_key, game_name, tag_line)
+        platform = await _spectate_find_lol_platform(session, api_key, puuid)
+        cached = {"puuid": puuid, "platform": platform}
+        self._identity_cache[key] = cached
+        return cached
+
+    async def _fetch_match_v5(self, session: aiohttp.ClientSession, api_key: str, region: str, match_id: str) -> tuple[int, object]:
+        url = f"https://{region}.api.riotgames.com/lol/match/v5/matches/{match_id}"
+        return await _spectate_http_get_json(session, url, api_key)
+
+    # -----------------------------
+    # Discord vote handling
+    # -----------------------------
+
+    async def handle_vote(self, interaction: discord.Interaction, match_id: str, choice: str) -> None:
+        sess = self._sessions.get(match_id)
+        if not sess or not sess.voting_open:
+            await interaction.response.send_message("Voting is closed for this match.", ephemeral=True)
+            return
+
+        sess.votes[interaction.user.id] = choice
+        await interaction.response.send_message(
+            f"Saved your prediction: **{choice}** for **{_prediction_fmt_team(sess.team_id)}**.",
+            ephemeral=True,
+        )
+
+        # Update counts live
+        try:
+            await self._update_prediction_message(sess)
+        except Exception:
+            pass
+
+    async def _update_prediction_message(self, sess: PredictionSession) -> None:
+        if not sess.message_id:
+            return
+        channel = self.bot.get_channel(sess.channel_id)
+        if not isinstance(channel, discord.abc.Messageable):
+            return
+        msg = await channel.fetch_message(sess.message_id)
+
+        win_votes = sum(1 for v in sess.votes.values() if v == "WIN")
+        lose_votes = sum(1 for v in sess.votes.values() if v == "LOSE")
+
+        embed = _prediction_embed_for_match(
+            title_line=sess.title_line,
+            team_id=sess.team_id,
+            game_start_ms=sess.game_start_time_ms,
+            voting_open=sess.voting_open,
+            voting_closed_at_ms=sess.voting_closed_at_ms,
+            win_votes=win_votes,
+            lose_votes=lose_votes,
+            tracked_names=[t["name"] for t in sess.tracked],
+        )
+
+        view = PredictionView(self, sess.match_id) if sess.voting_open else None
+        await msg.edit(embed=embed, view=view)
+
+    # -----------------------------
+    # Session lifecycle
+    # -----------------------------
+
+    async def _post_prediction_message(self, sess: PredictionSession) -> None:
+        channel = self.bot.get_channel(sess.channel_id)
+        if not isinstance(channel, discord.abc.Messageable):
+            print("[Predict] Could not access prediction channel.")
+            return
+
+        # Initial placeholder
+        msg = await channel.send(embed=discord.Embed(title="Prediction time!", description="Starting prediction…"), view=PredictionView(self, sess.match_id))
+        sess.message_id = msg.id
+        await self._update_prediction_message(sess)
+
+        # Schedule voting close
+        asyncio.create_task(self._schedule_voting_close_and_score(sess.match_id))
+
+    async def _schedule_voting_close_and_score(self, match_id: str) -> None:
+        sess = self._sessions.get(match_id)
+        if not sess:
+            return
+
+        close_at_ms = sess.game_start_time_ms + PREDICTION_VOTING_CLOSE_AFTER_SECONDS * 1000
+        delay = max(0.0, (close_at_ms - int(time.time() * 1000)) / 1000.0)
+        await asyncio.sleep(delay)
+
+        # Close voting
+        sess = self._sessions.get(match_id)
+        if not sess or not sess.voting_open:
+            return
+        sess.voting_open = False
+        sess.voting_closed_at_ms = int(time.time() * 1000)
+
+        # Remove buttons
+        try:
+            if sess.message_id:
+                channel = self.bot.get_channel(sess.channel_id)
+                if isinstance(channel, discord.abc.Messageable):
+                    msg = await channel.fetch_message(sess.message_id)
+                    await msg.edit(view=None)
+        except Exception:
+            pass
+
+        # Update embed with "voting closed" line
+        try:
+            await self._update_prediction_message(sess)
+        except Exception:
+            pass
+
+        # Wait for match result and score
+        await self._wait_for_match_and_score(match_id)
+
+    async def _wait_for_match_and_score(self, match_id: str) -> None:
+        sess = self._sessions.get(match_id)
+        if not sess or sess.result_posted:
+            return
+
+        api_key = os.getenv("RIOT_API_KEY")
+        if not api_key:
+            print("[Predict] RIOT_API_KEY not set; cannot score.")
+            return
+
+        deadline = time.time() + PREDICTION_RESULT_TIMEOUT_SECONDS
+        last_err = None
+
+        # Use any tracked participant's puuid to determine win/team
+        tracked_puuid = sess.tracked[0]["puuid"] if sess.tracked else None
+        if not tracked_puuid:
+            return
+
+        async with aiohttp.ClientSession() as http:
+            while time.time() < deadline:
+                try:
+                    code, payload = await self._fetch_match_v5(http, api_key, sess.region, sess.match_id)
+                    if code == 200 and isinstance(payload, dict):
+                        info = payload.get("info") or {}
+                        participants = info.get("participants") or []
+                        game_dur = int(info.get("gameDuration") or 0)
+
+                        # Remake / early end => void
+                        if 0 < game_dur < PREDICTION_REMAKE_THRESHOLD_SECONDS:
+                            await self._void_match(sess, reason=f"Remake/short game ({game_dur}s).")
+                            return
+
+                        # Determine result for the tracked team
+                        win = None
+                        team_id = None
+                        for p in participants:
+                            if p.get("puuid") == tracked_puuid:
+                                win = bool(p.get("win"))
+                                team_id = int(p.get("teamId") or 0)
+                                break
+                        if win is None or team_id not in (100, 200):
+                            last_err = "Match found but tracked participant missing."
+                            await asyncio.sleep(10)
+                            continue
+
+                        # Score voters
+                        await self._apply_scoring_and_post_result(sess, win=bool(win), final_team_id=int(team_id))
+                        return
+
+                    if code == 404:
+                        last_err = "Match not found yet."
+                        await asyncio.sleep(10)
+                        continue
+                    if code == 429:
+                        last_err = "Rate limited (match-v5)."
+                        await asyncio.sleep(15)
+                        continue
+                    if code == 403:
+                        last_err = "403 Forbidden (Riot key invalid/expired)."
+                        break
+
+                    last_err = f"Unexpected match-v5 response: {code}"
+                    await asyncio.sleep(10)
+                except Exception as e:
+                    last_err = f"{type(e).__name__}: {e}"
+                    await asyncio.sleep(10)
+
+        # Timed out
+        await self._void_match(sess, reason=f"Timed out waiting for match result. ({last_err})")
+
+    async def _void_match(self, sess: PredictionSession, reason: str) -> None:
+        if not sess.message_id:
+            return
+        channel = self.bot.get_channel(sess.channel_id)
+        if not isinstance(channel, discord.abc.Messageable):
+            return
+        try:
+            msg = await channel.fetch_message(sess.message_id)
+            await msg.edit(embed=discord.Embed(description=f"**No contest**\n{reason}\n\nScores unchanged."), view=None)
+        except Exception:
+            pass
+
+        asyncio.create_task(self._delete_message_later(sess.channel_id, sess.message_id))
+        sess.result_posted = True
+        self._sessions.pop(sess.match_id, None)
+
+    async def _apply_scoring_and_post_result(self, sess: PredictionSession, win: bool, final_team_id: int) -> None:
+        # WIN vote means the tracked team wins.
+        correct_ids: list[int] = []
+        wrong_ids: list[int] = []
+
+        async with self._scores_lock:
+            for uid, vote in list(sess.votes.items()):
+                is_correct = (vote == "WIN" and win) or (vote == "LOSE" and not win)
+                member = None
+                try:
+                    member = self.bot.get_user(uid) or await self.bot.fetch_user(uid)
+                except Exception:
+                    member = None
+
+                if member:
+                    entry = _prediction_upsert_user(self._scores, member)
+                    if is_correct:
+                        entry["correct"] += 1
+                        correct_ids.append(uid)
+                    else:
+                        entry["wrong"] += 1
+                        wrong_ids.append(uid)
+                else:
+                    # Still track by id if fetch failed
+                    users = self._scores.setdefault("users", {})
+                    entry = users.get(str(uid)) or {"name": f"User-{uid}", "correct": 0, "wrong": 0}
+                    if is_correct:
+                        entry["correct"] = int(entry.get("correct", 0)) + 1
+                        correct_ids.append(uid)
+                    else:
+                        entry["wrong"] = int(entry.get("wrong", 0)) + 1
+                        wrong_ids.append(uid)
+                    users[str(uid)] = entry
+
+            _prediction_save_scores(self._scores)
+
+        # Post result by editing original message
+        if not sess.message_id:
+            return
+        channel = self.bot.get_channel(sess.channel_id)
+        if not isinstance(channel, discord.abc.Messageable):
+            return
+
+        correct_mentions = [f"<@{uid}>" for uid in correct_ids]
+        wrong_mentions = [f"<@{uid}>" for uid in wrong_ids]
+
+        embed = _prediction_result_embed(
+            title_line=sess.title_line,
+            team_id=final_team_id,
+            win=win,
+            correct_mentions=correct_mentions,
+            incorrect_mentions=wrong_mentions,
+            tracked_names=[t["name"] for t in sess.tracked],
+        )
+
+        try:
+            msg = await channel.fetch_message(sess.message_id)
+            await msg.edit(embed=embed, view=None)
+        except Exception:
+            pass
+
+        asyncio.create_task(self._delete_message_later(sess.channel_id, sess.message_id))
+        sess.result_posted = True
+        self._sessions.pop(sess.match_id, None)
+
+    async def _delete_message_later(self, channel_id: int, message_id: int) -> None:
+        await asyncio.sleep(PREDICTION_DELETE_AFTER_SECONDS)
+        try:
+            channel = self.bot.get_channel(channel_id)
+            if isinstance(channel, discord.abc.Messageable):
+                msg = await channel.fetch_message(message_id)
+                await msg.delete()
+        except Exception:
+            pass
+
+    # -----------------------------
+    # Poll loop
+    # -----------------------------
+
+    @tasks.loop(seconds=PREDICTION_POLL_INTERVAL_SECONDS)
+    async def prediction_poll_loop(self):
+        api_key = os.getenv("RIOT_API_KEY")
+        if not api_key:
+            return
+
+        # Prune seen map (keep 2 hours)
+        now = time.time()
+        self._recent_seen = {k: v for k, v in self._recent_seen.items() if now - v < 2 * 3600}
+
+        # Build: match_id -> {platform, platform_id, region, game_id, queue_id, tracked:[...] , game_start_time_ms}
+        games: dict[str, dict] = {}
+
+        try:
+            async with aiohttp.ClientSession() as http:
+                # Resolve and check active game for each tracked profile
+                for display_name, riot in (FLEX_PROFILES or {}).items():
+                    game_name = riot.get("sumname")
+                    tag_line = riot.get("tag")
+                    if not game_name or not tag_line:
+                        continue
+
+                    try:
+                        ident = await self._resolve_identity(http, api_key, game_name, tag_line)
+                        puuid = ident["puuid"]
+                        platform = ident["platform"]
+
+                        in_game, info = await _spectate_check_active_game(http, api_key, platform, puuid)
+                        if not in_game or not info:
+                            continue
+
+                        queue_id = int(info.get("gameQueueConfigId") or 0)
+                        if queue_id not in (420, 440):
+                            continue  # only ranked Solo/Duo and Flex
+
+                        platform_id = str(info.get("platformId") or platform).upper()
+                        game_id = int(info.get("gameId"))
+                        match_id = _prediction_make_match_id(platform_id, game_id)
+                        region = _prediction_match_region_for_platform(platform)
+                        gst = int(info.get("gameStartTime") or int(time.time() * 1000))
+
+                        # Determine this player's team
+                        team_id = None
+                        for p in (info.get("participants") or []):
+                            if p.get("puuid") == puuid:
+                                team_id = int(p.get("teamId") or 0)
+                                break
+                        if team_id not in (100, 200):
+                            continue
+
+                        g = games.setdefault(match_id, {
+                            "platform": platform,
+                            "platform_id": platform_id,
+                            "region": region,
+                            "game_id": game_id,
+                            "queue_id": queue_id,
+                            "game_start_time_ms": gst,
+                            "tracked": [],
+                        })
+                        g["queue_id"] = queue_id  # should match for all participants
+                        # Use earliest start time (in case)
+                        g["game_start_time_ms"] = min(int(g.get("game_start_time_ms") or gst), gst)
+                        g["tracked"].append({"name": display_name, "puuid": puuid, "teamId": team_id})
+                    except SpectateAPIError as e:
+                        # Rate limit etc; just skip this cycle
+                        print(f"[Predict] Riot error for {display_name}: {e}")
+                        continue
+                    except Exception as e:
+                        print(f"[Predict] Error checking {display_name}: {type(e).__name__}: {e}")
+                        continue
+
+        except Exception as e:
+            print(f"[Predict] poll loop error: {e}")
+            return
+
+        # Create sessions for new games
+        for match_id, g in games.items():
+            if match_id in self._sessions:
+                continue
+            if match_id in self._recent_seen:
+                continue
+
+            tracked = g.get("tracked") or []
+            if not tracked:
+                continue
+
+            # Determine display label
+            queue_id = int(g.get("queue_id") or 0)
+            title_line = ""
+            if queue_id == 440:
+                title_line = "Ranked Flex"
+            elif queue_id == 420:
+                # DuoQ if >=2 tracked on same team
+                by_team = {}
+                for t in tracked:
+                    by_team.setdefault(int(t.get("teamId") or 0), []).append(t)
+                duo_team = None
+                for tid, members in by_team.items():
+                    if tid in (100, 200) and len(members) >= 2:
+                        duo_team = tid
+                        break
+                if duo_team:
+                    title_line = "DuoQ (Ranked Solo/Duo)"
+                else:
+                    title_line = "SoloQ (Ranked Solo/Duo)"
+            else:
+                continue
+
+            # Use the team of the first tracked member (for win/loss), unless SoloQ duo detected.
+            team_id = int(tracked[0].get("teamId") or 0)
+            if queue_id == 420:
+                # If duo detected, pin to that duo team
+                by_team = {}
+                for t in tracked:
+                    by_team.setdefault(int(t.get("teamId") or 0), []).append(t)
+                for tid, members in by_team.items():
+                    if tid in (100, 200) and len(members) >= 2:
+                        team_id = tid
+                        break
+
+            sess = PredictionSession(
+                match_id=match_id,
+                platform=str(g.get("platform")),
+                region=str(g.get("region")),
+                platform_id=str(g.get("platform_id")),
+                game_id=int(g.get("game_id")),
+                queue_id=queue_id,
+                title_line=title_line,
+                tracked=tracked,
+                team_id=team_id,
+                game_start_time_ms=int(g.get("game_start_time_ms")),
+                channel_id=self._channel_id,
+            )
+            self._sessions[match_id] = sess
+            self._recent_seen[match_id] = time.time()
+
+            # Post poll
+            await self._post_prediction_message(sess)
+
+    @prediction_poll_loop.before_loop
+    async def _before_prediction_poll_loop(self):
+        await self.bot.wait_until_ready()
+
+    # -----------------------------
+    # Slash command: /prediction_leaderboard
+    # -----------------------------
+
+    @app_commands.command(name="prediction_leaderboard", description="View prediction leaderboard (+1 correct, -1 wrong).")
+    async def prediction_leaderboard(self, interaction: discord.Interaction):
+        data = _prediction_load_scores()
+        users = (data.get("users") or {})
+
+        rows = []
+        for uid, entry in users.items():
+            try:
+                correct = int(entry.get("correct", 0))
+                wrong = int(entry.get("wrong", 0))
+            except Exception:
+                correct, wrong = 0, 0
+            total = correct + wrong
+            if total <= 0:
+                continue
+            score = correct - wrong
+            acc = (correct / total) * 100.0 if total else 0.0
+            name = str(entry.get("name") or f"User-{uid}")
+            rows.append({"name": name, "score": score, "correct": correct, "wrong": wrong, "acc": acc})
+
+        rows.sort(key=lambda r: (r["score"], r["acc"], r["correct"]), reverse=True)
+
+        if not rows:
+            await interaction.response.send_message("No prediction history yet.", ephemeral=True)
+            return
+
+        top = rows[:25]
+        # Build a compact monospace table
+        lines = []
+        lines.append(f"{'#':>2}  {'Discord':<18}  {'Score':>5}  {'W-L':>7}  {'Acc%':>6}")
+        lines.append("-" * 46)
+        for i, r in enumerate(top, start=1):
+            wl = f"{r['correct']}-{r['wrong']}"
+            nm = r["name"]
+            if len(nm) > 18:
+                nm = nm[:15] + "…"
+            lines.append(f"{i:>2}  {nm:<18}  {r['score']:>5}  {wl:>7}  {r['acc']:>5.0f}%")
+
+        embed = discord.Embed(
+            title="📊 Prediction Leaderboard",
+            description="```text\n" + "\n".join(lines) + "\n```",
+        )
+        await interaction.response.send_message(embed=embed)
 
 
 #$env:ENABLE_KEYSEQ_PRESS="1"
@@ -244,6 +940,49 @@ DPM_FLEX_PROFILES = {
     },
     # "Parker": { ... },
     # etc.
+}
+
+FLEX_PROFILES = {
+    "Blake": {
+        "sumname": "Schmort",
+        "tag": "bone",
+    },
+    "Parky": {
+        "sumname": "Parky",
+        "tag": "NA1",
+    },
+    "Josh": {
+        "sumname": "DrkCloak",
+        "tag": "NA1",
+    },
+    "Bi": {
+        "sumname": "WhiteSwan",
+        "tag": "4242",
+    },
+    "Cody": {
+        "sumname": "Cody",
+        "tag": "1414",
+    },
+    "Ash": {
+        "sumname": "Ash",
+        "tag": "uoplw",
+    },
+    "Oqi": {
+        "sumname": "Oqi",
+        "tag": "NA1",
+    },
+    "Michael": {
+        "sumname": "MadiHales",
+        "tag": "NA1",
+    },
+    "Jeff": {
+        "sumname": "Tacoboy7777",
+        "tag": "NA1",
+    },
+    "Marcus": {
+        "sumname": "Cylainius",
+        "tag": "NOXUS",
+    }
 }
 
 DPM_FLEX_PROFILES_OLD = {
@@ -3268,7 +4007,7 @@ async def klipy_pick_random_media_url() -> str:
 
     base = f"https://api.klipy.com/api/v1/{KLIPY_APP_KEY}/gifs/trending"
     params = {
-        "page": 1,
+        "page": random.randint(1, 10),
         "per_page": 50,
         "customer_id": KLIPY_CUSTOMER_ID,
         "locale": KLIPY_LOCALE,
@@ -3284,12 +4023,14 @@ async def klipy_pick_random_media_url() -> str:
     (TMP_DIR / "klipy_debug.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     urls = collect_urls(payload)
-    random.shuffle(urls)
+    urls = list(set(urls))
 
-    best = pick_best_media_url(urls)
-    if not best:
-        raise RuntimeError("No usable media URL found in KLIPY response (see tmp/klipy_debug.json).")
-    return best
+    # prefer video but don't force it
+    video = [u for u in urls if any(x in u.lower() for x in ("mp4", "webm"))]
+    gifs  = [u for u in urls if u.lower().endswith(".gif")]
+
+    pool = video if video and random.random() < 0.7 else gifs or urls
+    return random.choice(pool)
 
 async def download_file(url: str, out_path: Path) -> None:
     async with aiohttp.ClientSession() as session:
@@ -4128,6 +4869,7 @@ async def on_ready():
     await bot.add_cog(ShopCog(bot))
     await bot.add_cog(RPSCog(bot))
     await bot.add_cog(CustomsCog(bot))
+    await bot.add_cog(PredictionCog(bot))
 
     if not opgg_cache_refresh_loop.is_running():
         opgg_cache_refresh_loop.start()
@@ -4177,6 +4919,44 @@ async def on_ready():
         print('No existing messages file found. Initiating message collection...')
         await collect_user_messages()
     print('Bot is ready.')
+
+MAX_DISCORD_LEN = 2000
+
+def _chunk_text(s: str, limit: int = MAX_DISCORD_LEN):
+    """Split text into <= limit chunks, preferring newlines, then spaces."""
+    s = s or ""
+    chunks = []
+    while len(s) > limit:
+        cut = s.rfind("\n", 0, limit)
+        if cut == -1:
+            cut = s.rfind(" ", 0, limit)
+        if cut == -1:
+            cut = limit
+        chunks.append(s[:cut].rstrip())
+        s = s[cut:].lstrip()
+    if s:
+        chunks.append(s)
+    return chunks
+
+async def safe_reply(message: discord.Message, text: str, **kwargs):
+    """
+    Replies safely under Discord 2000 char limit.
+    Sends first chunk as a reply, remaining chunks as normal sends.
+    """
+    parts = _chunk_text(text, MAX_DISCORD_LEN)
+
+    # If empty, do nothing
+    if not parts:
+        return None
+
+    # First chunk as reply
+    first = await message.reply(parts[0], **kwargs)
+
+    # Remaining chunks as follow-ups
+    for p in parts[1:]:
+        await message.channel.send(p)
+    return first
+
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -4316,7 +5096,8 @@ async def on_message(message: discord.Message):
 
     reply_text = normalize_visible_ats(reply_text)
 
-    await message.reply(reply_text)
+    await safe_reply(message, reply_text)
+
 
     # add income for normal user messages
     if not message.author.bot:
