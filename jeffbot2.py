@@ -61,12 +61,20 @@ from urllib.parse import urlparse
 _PREDICTION_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # If env var is not set, we will fall back to FLEX_LEADERBOARD_CHANNEL_ID once it is defined later in this file.
-PREDICTION_CHANNEL_ID = int(os.getenv("PREDICTION_CHANNEL_ID", "0"))
-PREDICTION_POLL_INTERVAL_SECONDS = int(os.getenv("PREDICTION_POLL_INTERVAL_SECONDS", "20"))
-PREDICTION_VOTING_CLOSE_AFTER_SECONDS = int(os.getenv("PREDICTION_VOTING_CLOSE_AFTER_SECONDS", "90"))
-PREDICTION_DELETE_AFTER_SECONDS = int(os.getenv("PREDICTION_DELETE_AFTER_SECONDS", "300"))
-PREDICTION_REMAKE_THRESHOLD_SECONDS = int(os.getenv("PREDICTION_REMAKE_THRESHOLD_SECONDS", "300"))
-PREDICTION_RESULT_TIMEOUT_SECONDS = int(os.getenv("PREDICTION_RESULT_TIMEOUT_SECONDS", "600"))
+PREDICTION_CHANNEL_ID = 753959443263389737
+PREDICTION_POLL_INTERVAL_SECONDS = 20
+
+# Prediction message timing (requested behavior)
+# - Prediction message is posted and voting is open for 4m30s
+# - Voting locks for 30s, then the prediction message is deleted
+# - When the game ends, a NEW result message is posted for 60s then deleted
+PREDICTION_VOTING_OPEN_SECONDS = 270
+PREDICTION_VOTING_LOCK_SECONDS = 30
+PREDICTION_PREDICTION_MESSAGE_DELETE_AFTER_SECONDS = PREDICTION_VOTING_OPEN_SECONDS + PREDICTION_VOTING_LOCK_SECONDS
+PREDICTION_RESULT_MESSAGE_DELETE_AFTER_SECONDS = 60
+
+PREDICTION_REMAKE_THRESHOLD_SECONDS = 360
+PREDICTION_RESULT_TIMEOUT_SECONDS = 5400
 PREDICTION_SCORES_FILE = os.getenv("PREDICTION_SCORES_FILE", os.path.join(_PREDICTION_BASE_DIR, "prediction_scores.json"))
 
 _PRED_PLATFORM_TO_REGION = {
@@ -144,45 +152,60 @@ def _prediction_embed_for_match(
     win_votes: int,
     lose_votes: int,
     tracked_names: list[str],
+    role_lines: list[str] | None = None,
 ) -> discord.Embed:
     start_unix = int(game_start_ms // 1000)
     if voting_open:
-        vote_line = "Voting open."
+        vote_line = 'Voting open.'
     else:
         closed_unix = int((voting_closed_at_ms // 1000) if voting_closed_at_ms else start_unix)
-        vote_line = f"Voting closed {_prediction_fmt_ts_discord(closed_unix)}."
+        vote_line = f'Voting closed {_prediction_fmt_ts_discord(closed_unix)}.'
 
-    roster = ", ".join(tracked_names) if tracked_names else "(none)"
+    roster = ', '.join(tracked_names) if tracked_names else '(none)'
     desc = (
-        f"**Prediction time!** {title_line}\n"
-        f"Tracked in match: **{roster}**\n"
-        f"Team: **{_prediction_fmt_team(team_id)}**\n\n"
-        f"Match started {_prediction_fmt_ts_discord(start_unix)}\n"
-        f"{vote_line}\n\n"
-        f"Current votes: ✅ WIN **{win_votes}** | ❌ LOSE **{lose_votes}**"
+        f'**Prediction time!** {title_line}\n'
+        f'Tracked in match: **{roster}**\n'
+        f'Team: **{_prediction_fmt_team(team_id)}**\n\n'
+        f'Match started {_prediction_fmt_ts_discord(start_unix)}\n'
+        f'{vote_line}\n\n'
+        f'Current votes: ✅ WIN **{win_votes}** | ❌ LOSE **{lose_votes}**'
     )
+
+    # Champs-only matchup table (5 lines: TOP/JG/MID/ADC/SPP).
+    if role_lines:
+        table = '```text\n' + '\n'.join(role_lines) + '\n```'
+        desc += '\n\n' + table
+
     return discord.Embed(description=desc)
+
 
 
 def _prediction_result_embed(
     title_line: str,
     team_id: int,
     win: bool,
-    correct_mentions: list[str],
-    incorrect_mentions: list[str],
+    correct_lines: list[str],
+    incorrect_lines: list[str],
     tracked_names: list[str],
+    leaderboard_text: str | None = None,
 ) -> discord.Embed:
     roster = ", ".join(tracked_names) if tracked_names else "(none)"
     result_line = f"**{title_line}** on **{_prediction_fmt_team(team_id)}** **{'WON ✅' if win else 'LOST ❌'}**"
-    e = discord.Embed(description=f"{result_line}\n\nTracked in match: **{roster}**")
+
+    desc = f"{result_line}\n\nTracked in match: **{roster}**"
+    if leaderboard_text:
+        # Put leaderboard table where the matchup table used to be.
+        desc += "\n\n" + leaderboard_text
+
+    e = discord.Embed(description=desc)
     e.add_field(
         name="Who was right (+1)",
-        value="\n".join(correct_mentions) if correct_mentions else "Nobody 😅",
+        value="\n".join(correct_lines) if correct_lines else "Nobody 😅",
         inline=True,
     )
     e.add_field(
         name="Who was wrong (-1)",
-        value="\n".join(incorrect_mentions) if incorrect_mentions else "Nobody 🎉",
+        value="\n".join(incorrect_lines) if incorrect_lines else "Nobody 🎉",
         inline=True,
     )
     return e
@@ -221,6 +244,9 @@ class PredictionSession:
     channel_id: int
     message_id: int | None = None
 
+    # Champ matchup table lines (TOP/JG/MID/ADC/SPP): each line is 'ROLE: BlueChamp | RedChamp'
+    role_lines: list[str] = field(default_factory=list)
+
     votes: dict[int, str] = field(default_factory=dict)  # discord user id -> "WIN"/"LOSE"
     voting_open: bool = True
     voting_closed_at_ms: int | None = None
@@ -229,13 +255,17 @@ class PredictionSession:
     created_at_ms: int = field(default_factory=lambda: int(time.time() * 1000))
 
 
+    # Throttle role-table refresh (spectator fields can be missing early)
+    last_role_refresh_ts: float = 0.0
+
+
 class PredictionCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
         # Resolve destination channel at runtime (FLEX_LEADERBOARD_CHANNEL_ID is defined later in the file).
         fallback_channel = globals().get("FLEX_LEADERBOARD_CHANNEL_ID") or 0
-        self._channel_id = int(PREDICTION_CHANNEL_ID or fallback_channel or 0)
+        self._channel_id = int(PREDICTION_CHANNEL_ID or 0)
         if self._channel_id == 0:
             print("[Predict] WARNING: No prediction channel set. Set PREDICTION_CHANNEL_ID env var.")
 
@@ -253,10 +283,503 @@ class PredictionCog(commands.Cog):
         self._scores = _prediction_load_scores()
         self._scores_lock = asyncio.Lock()
 
+        # Data Dragon cache for champId -> champName (avoid repeated HTTP)
+        self._ddragon_cache = {"ts": 0.0, "map": {}}
+
+        # Cache ranked entries per summonerId to avoid rate limits.
+        # key: encryptedSummonerId -> {ts, best_str, strength}
+        self._league_rank_cache: dict[str, dict] = {}
+
         # Start poll loop
         self.prediction_poll_loop.start()
 
-    # -----------------------------
+
+    async def _ddragon_get_champ_map(self, http: aiohttp.ClientSession) -> dict[int, str]:
+        """Return cached champId -> champName map from Data Dragon."""
+        try:
+            now = time.time()
+            cached = self._ddragon_cache
+            if cached.get("map") and (now - float(cached.get("ts") or 0.0)) < 24 * 3600:
+                return cached["map"]
+
+            # versions.json -> latest patch
+            async with http.get("https://ddragon.leagueoflegends.com/api/versions.json", timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                versions = await resp.json()
+            if not versions:
+                return cached.get("map") or {}
+            ver = str(versions[0])
+
+            url = f"https://ddragon.leagueoflegends.com/cdn/{ver}/data/en_US/champion.json"
+            async with http.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                payload = await resp.json()
+
+            data = (payload or {}).get("data") or {}
+            champ_map: dict[int, str] = {}
+            for _k, v in data.items():
+                try:
+                    champ_id = int(v.get("key"))
+                    champ_name = str(v.get("name"))
+                    if champ_id and champ_name:
+                        champ_map[champ_id] = champ_name
+                except Exception:
+                    continue
+
+            self._ddragon_cache = {"ts": now, "map": champ_map}
+            return champ_map
+        except Exception:
+            return self._ddragon_cache.get("map") or {}
+
+
+
+    def _entry_score(self, e: dict) -> tuple[int, int, int]:
+        """Best-of (Solo vs Flex) rank ordering: Tier -> Division -> LP."""
+        tier = str(e.get('tier') or '').upper()
+        div = str(e.get('rank') or '').upper()
+        try:
+            lp = int(e.get('leaguePoints') or 0)
+        except Exception:
+            lp = 0
+
+        tier_order = {
+            'IRON': 0, 'BRONZE': 1, 'SILVER': 2, 'GOLD': 3, 'PLATINUM': 4,
+            'EMERALD': 5, 'DIAMOND': 6, 'MASTER': 7, 'GRANDMASTER': 8, 'CHALLENGER': 9,
+        }
+        div_order = {'IV': 0, 'III': 1, 'II': 2, 'I': 3}
+        return (tier_order.get(tier, -1), div_order.get(div, -1), lp)
+
+    def _best_rank_string(self, entries: list[dict]) -> str:
+        """Choose higher of SoloQ vs Flex; return the same label format as rolesranks.py."""
+        solo = None
+        flex = None
+        for e in entries or []:
+            if not isinstance(e, dict):
+                continue
+            qt = e.get('queueType')
+            if qt == 'RANKED_SOLO_5x5':
+                solo = e
+            elif qt == 'RANKED_FLEX_SR':
+                flex = e
+
+        if not solo and not flex:
+            return 'Unranked'
+
+        if solo and flex:
+            use = solo if self._entry_score(solo) >= self._entry_score(flex) else flex
+        else:
+            use = solo or flex
+
+        tier = str((use or {}).get('tier', '')).title()
+        div = str((use or {}).get('rank', '')).upper()
+        lp = (use or {}).get('leaguePoints', 0)
+        label = 'Solo' if use is solo else 'Flex'
+        if tier and div:
+            return f"{label}: {tier} {div} ({lp} LP)"
+        return f"{label}: Ranked"
+
+    async def _fetch_league_entries_by_puuid(self, http: aiohttp.ClientSession, api_key: str, platform: str, puuid: str) -> list[dict]:
+        """Async version of rolesranks.fetch_league_entries_by_puuid."""
+        try:
+            pu = str(puuid or '')
+            if not pu:
+                return []
+
+            # Cache per puuid (15 min)
+            cached = self._league_rank_cache.get(pu)
+            now = time.time()
+            if cached and (now - float(cached.get('ts') or 0.0)) < 15 * 60:
+                payload = cached.get('entries')
+                return payload if isinstance(payload, list) else []
+
+            url = f"https://{platform}.api.riotgames.com/lol/league/v4/entries/by-puuid/{quote(pu, safe='')}"
+            code, payload = await _spectate_http_get_json(http, url, api_key)
+            if code == 200 and isinstance(payload, list):
+                self._league_rank_cache[pu] = {'ts': now, 'entries': payload}
+                return payload
+
+            if code == 404:
+                self._league_rank_cache[pu] = {'ts': now, 'entries': []}
+                return []
+
+            return []
+        except Exception:
+            return []
+
+    def _infer_role_from_spells(self, spell1_id: int, spell2_id: int) -> str:
+        """Infer role early-game using the same heuristic as rolesranks.py."""
+        SPELL_SMITE = 11
+        SPELL_TELEPORT = 12
+        SPELL_HEAL = 7
+        SPELL_EXHAUST = 3
+
+        spells = {int(spell1_id or 0), int(spell2_id or 0)}
+        if SPELL_SMITE in spells:
+            return 'JUNGLE'
+        if SPELL_EXHAUST in spells:
+            return 'SUPPORT'
+        if SPELL_HEAL in spells:
+            return 'ADC'
+        if SPELL_TELEPORT in spells:
+            return 'TOP'
+        return 'MID'
+
+    async def _build_champ_role_lines(self, http: aiohttp.ClientSession, api_key: str, platform: str, participants: list[dict], our_team_id: int, tracked: list[dict] | None = None, queue_id: int | None = None) -> list[str]:
+        """Build a matchup table WITHOUT positions.
+
+        Format (keeps alignment via fixed widths and a single vertical divider):
+
+            ALLIES                 | ENEMIES
+            Ryze (Cylainius)       | Smolder (S) D2
+            ...
+
+        Enemy rank formats:
+          - Champ (S) D2   -> SoloQ Diamond II
+          - Champ (F) M130 -> Flex Master 130 LP
+          - Champ (S) GM   -> SoloQ Grandmaster
+          - Champ (S) CH   -> SoloQ Challenger
+          - Champ (Anon)   -> streamer mode / no rank info / missing puuid
+        """
+        champ_map = await self._ddragon_get_champ_map(http)
+
+        our_team_id = int(our_team_id or 0)
+        enemy_team_id = 200 if our_team_id == 100 else 100
+
+        def champ_name_from_id(cid: int) -> str:
+            try:
+                cid = int(cid or 0)
+            except Exception:
+                cid = 0
+            return champ_map.get(cid) or (str(cid) if cid else '—')
+
+        def roman_to_int(r: str) -> int | None:
+            m = {'I': 1, 'II': 2, 'III': 3, 'IV': 4}
+            return m.get(str(r or '').upper().strip())
+
+        def compact_rank(entries: list[dict]) -> tuple[str | None, str | None]:
+            """Return (queue_letter, compact_rank) or (None, None) if no info."""
+            try:
+                solo = None
+                flex = None
+                for e in entries or []:
+                    q = str(e.get('queueType') or '').upper()
+                    if q == 'RANKED_SOLO_5X5':
+                        solo = e
+                    elif q == 'RANKED_FLEX_SR':
+                        flex = e
+
+                use = None
+                if solo and flex:
+                    use = solo if self._entry_score(solo) >= self._entry_score(flex) else flex
+                else:
+                    use = solo or flex
+
+                if not use:
+                    return (None, None)
+
+                q_letter = 'S' if use is solo else 'F'
+                tier = str(use.get('tier') or '').upper().strip()
+                div = str(use.get('rank') or '').upper().strip()
+                lp = int(use.get('leaguePoints') or 0)
+
+                if tier in ('CHALLENGER', 'GRANDMASTER'):
+                    return (q_letter, 'CH' if tier == 'CHALLENGER' else 'GM')
+                if tier == 'MASTER':
+                    return (q_letter, f"M{lp}" if lp > 0 else 'M')
+
+                # Diamond and below: first letter + division number (I->1, II->2, ...)
+                div_n = roman_to_int(div)
+                if tier and div_n:
+                    return (q_letter, f"{tier[0]}{div_n}")
+
+                return (q_letter, None)
+            except Exception:
+                return (None, None)
+
+        allies: list[dict] = []
+        enemies: list[dict] = []
+
+        tracked_map: dict[str, str] = {}
+        for t in (tracked or []):
+            try:
+                pu = str(t.get('puuid') or '').strip()
+                nm = str(t.get('name') or '').strip()
+                if pu and nm:
+                    tracked_map[pu] = nm
+            except Exception:
+                pass
+
+        for p in (participants or []):
+            try:
+                team_id = int(p.get('teamId') or 0)
+                if team_id not in (100, 200):
+                    continue
+
+                champ = champ_name_from_id(int(p.get('championId') or 0))
+                puuid = str(p.get('puuid') or '').strip()
+                # Only use *tracked list* names for ally display.
+                # If they aren't tracked, we will show rank instead of "(Anon)".
+                tracked_name = tracked_map.get(puuid)
+                #@#####AHHHHH
+                spell1 = int(p.get('spell1Id') or 0)
+                spell2 = int(p.get('spell2Id') or 0)
+
+                rec = {
+                    'champ': champ,
+                    'tracked_name': tracked_map.get(puuid),  # only set if this ally is in the tracked list
+                    'summoner': str(p.get('summonerName') or ''),
+                    'puuid': puuid,
+                    'spell1': spell1,
+                    'spell2': spell2,
+                }
+
+                if team_id == our_team_id:
+                    allies.append(rec)
+                elif team_id == enemy_team_id:
+                    enemies.append(rec)
+            except Exception:
+                continue
+
+        # --- Spell-based lane ordering (TOP / JG / MID / ADC / SPP) ---
+        ROLE_ORDER = ["TOP", "JG", "MID", "ADC", "SPP"]
+
+        SPELL_SMITE = 11
+        SPELL_TELEPORT = 12
+        SPELL_HEAL = 7
+        SPELL_EXHAUST = 3
+        SPELL_IGNITE = 14
+        SPELL_BARRIER = 21
+        SPELL_GHOST = 6
+
+        def _spells_set(r: dict) -> set[int]:
+            return {int(r.get("spell1") or 0), int(r.get("spell2") or 0)}
+
+        def _score_for_role(r: dict, role: str) -> int:
+            s = _spells_set(r)
+            score = 0
+
+            # Hard identifiers
+            if role == "JG":
+                return 10_000 if SPELL_SMITE in s else -10_000
+
+            if role == "ADC":
+                # Your rule: ADC will have Barrier
+                if SPELL_BARRIER in s:
+                    score += 5000
+                # common-but-not-required signals (helps if Barrier isn't present)
+                if SPELL_HEAL in s:
+                    score += 200
+                if SPELL_EXHAUST in s:
+                    score -= 100
+                if SPELL_TELEPORT in s:
+                    score -= 200
+
+            if role == "SPP":
+                # Your rule: support heal (maybe ignite or exh)
+                if SPELL_EXHAUST in s:
+                    score += 1200
+                if SPELL_IGNITE in s:
+                    score += 900
+                if SPELL_HEAL in s:
+                    score += 700
+                if SPELL_BARRIER in s:
+                    score -= 400
+                if SPELL_TELEPORT in s:
+                    score -= 200
+
+            if role == "MID":
+                # Your rule: likely ignite then TP
+                if SPELL_IGNITE in s:
+                    score += 1200
+                if SPELL_TELEPORT in s:
+                    score += 500
+                if SPELL_EXHAUST in s:
+                    score += 100
+                if SPELL_BARRIER in s:
+                    score -= 300
+                if SPELL_SMITE in s:
+                    score -= 5000
+
+            if role == "TOP":
+                # Your rule: TP ignite ghost
+                if SPELL_TELEPORT in s:
+                    score += 1200
+                if SPELL_GHOST in s:
+                    score += 700
+                if SPELL_IGNITE in s:
+                    score += 500
+                if SPELL_EXHAUST in s:
+                    score -= 200
+                if SPELL_BARRIER in s:
+                    score -= 300
+                if SPELL_SMITE in s:
+                    score -= 5000
+
+            return score
+
+        def _assign_by_spells(team: list[dict]) -> list[dict]:
+            # Build role->candidate list sorted by score desc
+            remaining = list(team)
+            assigned: dict[str, dict] = {}
+
+            # 1) Lock jungle (smite-only)
+            jg = None
+            for r in remaining:
+                if SPELL_SMITE in _spells_set(r):
+                    jg = r
+                    break
+            if jg:
+                assigned["JG"] = jg
+                remaining.remove(jg)
+
+            # 2) Try to lock ADC by Barrier
+            adc = None
+            for r in remaining:
+                if SPELL_BARRIER in _spells_set(r):
+                    adc = r
+                    break
+            if adc:
+                assigned["ADC"] = adc
+                remaining.remove(adc)
+
+            # 3) Greedy fill the rest by highest score per role, avoiding duplicates
+            for role in ["TOP", "MID", "SPP", "ADC"]:
+                if role in assigned:
+                    continue
+                if not remaining:
+                    break
+                # pick best remaining by score for this role
+                best = max(remaining, key=lambda r: _score_for_role(r, role))
+                assigned[role] = best
+                remaining.remove(best)
+
+            # Anything left (shouldn't happen), append
+            ordered = []
+            for role in ROLE_ORDER:
+                if role in assigned:
+                    ordered.append(assigned[role])
+            ordered.extend(remaining)
+            # Ensure length 5
+            return ordered[:5] + (["—"] * max(0, 5 - len(ordered)))
+
+        allies = _assign_by_spells(allies)
+        enemies = _assign_by_spells(enemies)
+
+
+        # Build enemy display strings with rank
+        enemy_disp: list[str] = []
+        def champ7(name: str) -> str:
+            name = str(name or '')
+            # 7 chars max; if longer, show first 6 plus a dot.
+            return name if len(name) <= 7 else name[:6] + '.'
+
+        def paren_name(name: str) -> str:
+            """Parenthesized summoner name capped to 10 chars total, like (ParkySm.)."""
+            name = str(name or '')
+            inner_max = 8  # 2 parentheses + 8 chars = 10
+            if len(name) <= inner_max:
+                inner = name
+            else:
+                inner = name[: inner_max - 1] + '.'
+            return f"({inner})"
+
+        # Build enemy display strings with rank
+        enemy_disp: list[str] = []
+        for e in enemies:
+            champ_full = e.get('champ') or '—'
+            champ = champ7(champ_full)
+
+            puuid = e.get('puuid') or ''
+            if not puuid:
+                enemy_disp.append(f"{champ} (Anon)")
+                continue
+
+            entries = await self._fetch_league_entries_by_puuid(http, api_key, platform, puuid)
+            q_letter, cr = compact_rank(entries if isinstance(entries, list) else [])
+
+            if not q_letter or not cr:
+                enemy_disp.append(f"{champ} (Anon)")
+            else:
+                # IMPORTANT: remove the space after (S)/(F)
+                enemy_disp.append(f"{champ} ({q_letter}){cr}")
+
+        # Helpers for compact display
+        def name_in_parens(name: str) -> str:
+            name = str(name or '')
+            # Requested: total 10 chars including parentheses, single dot truncation
+            # Example: (ParkySm.)
+            inner_max = 8
+            if len(name) <= inner_max:
+                inner = name
+            else:
+                inner = name[: inner_max - 1] + '.'
+            return f"({inner})"
+        # Allies display rules:
+        # - If ally is tracked (in tracked list) -> Champ (Name) with name capped to 10 chars total
+        # - If FLEX (queue 440) and ally is NOT tracked -> Champ (Summoner) (no rank)
+        # - Otherwise (e.g., SoloQ) if ally is NOT tracked -> Champ (S/F)RANK (same as enemies)
+        ally_disp: list[str] = []
+        for a in allies:
+            champ_full = a.get('champ') or '—'
+            champ = champ7(champ_full)
+
+            tracked_name = a.get('tracked_name')
+            summ_name = a.get('summoner') or ''
+            puuid = a.get('puuid') or ''
+
+            if tracked_name:
+                ally_disp.append(f"{champ} {paren_name(tracked_name)}")
+                continue
+
+            # FLEX: show champ + summoner name (no rank) for non-tracked allies
+            if int(queue_id or 0) == 440:
+                ally_disp.append(f"{champ} {paren_name(summ_name or 'Anon')}")
+                continue
+
+            # Non-flex behavior: fall back to compact rank (or Anon)
+            if not puuid:
+                ally_disp.append(f"{champ} (Anon)")
+                continue
+
+            entries = await self._fetch_league_entries_by_puuid(http, api_key, platform, puuid)
+            q_letter, cr = compact_rank(entries if isinstance(entries, list) else [])
+
+            if not q_letter or not cr:
+                ally_disp.append(f"{champ} (Anon)")
+            else:
+                # no space after (S)/(F)
+                ally_disp.append(f"{champ} ({q_letter}){cr}")
+
+
+        # Ensure exactly 5 lines per side
+        while len(ally_disp) < 5:
+            ally_disp.append('—')
+        while len(enemy_disp) < 5:
+            enemy_disp.append('—')
+        ally_disp = ally_disp[:5]
+        enemy_disp = enemy_disp[:5]
+
+        # Dynamic widths to prevent Discord mobile wrapping.
+        # Keep the table compact: smaller widths mean fewer trailing spaces.
+        max_left = max(len(s) for s in ally_disp + ['ALLIES'])
+        max_right = max(len(s) for s in enemy_disp + ['ENEMIES'])
+        left_w = max(len('ALLIES'), min(max_left, 16))
+        right_w = max(len('ENEMIES'), min(max_right, 16))
+
+        def fit(s: str, w: int) -> str:
+            s = str(s or '')
+            if len(s) > w:
+                if w <= 1:
+                    return s[:w]
+                # single-dot truncation (requested)
+                return s[: w - 1] + '.'
+            return s.ljust(w)
+
+        lines: list[str] = []
+        lines.append(f"{fit('ALLIES', left_w)} | {fit('ENEMIES', right_w).rstrip()}")
+        for i in range(5):
+            lines.append(f"{fit(ally_disp[i], left_w)} | {fit(enemy_disp[i], right_w).rstrip()}")
+
+        return lines
+
     # Riot API helpers (same method as predictor)
     # -----------------------------
 
@@ -289,10 +812,6 @@ class PredictionCog(commands.Cog):
             return
 
         sess.votes[interaction.user.id] = choice
-        await interaction.response.send_message(
-            f"Saved your prediction: **{choice}** for **{_prediction_fmt_team(sess.team_id)}**.",
-            ephemeral=True,
-        )
 
         # Update counts live
         try:
@@ -311,6 +830,33 @@ class PredictionCog(commands.Cog):
         win_votes = sum(1 for v in sess.votes.values() if v == "WIN")
         lose_votes = sum(1 for v in sess.votes.values() if v == "LOSE")
 
+        # Refresh champ/role table if it's still empty (spectator role fields can populate late).
+        try:
+            need_refresh = False
+            rl = getattr(sess, "role_lines", None) or []
+            if not rl:
+                need_refresh = True
+            else:
+                # If every line is placeholder, refresh.
+                joined = "".join(rl)
+                if "—" in joined and all(("—" in line) for line in rl):
+                    need_refresh = True
+
+            now = time.time()
+            if need_refresh and (now - float(getattr(sess, "last_role_refresh_ts", 0.0) or 0.0)) >= 20.0:
+                sess.last_role_refresh_ts = now
+                api_key = os.getenv("RIOT_API_KEY")
+                if api_key and sess.tracked:
+                    tracked_puuid = sess.tracked[0].get("puuid")
+                    if tracked_puuid:
+                        async with aiohttp.ClientSession() as http:
+                            in_game, info = await _spectate_check_active_game(http, api_key, sess.platform, tracked_puuid)
+                            if in_game and info:
+                                participants = info.get("participants") or []
+                                sess.role_lines = await self._build_champ_role_lines(http, api_key, sess.platform, participants, sess.team_id, tracked=sess.tracked, queue_id=sess.queue_id)
+        except Exception:
+            pass
+
         embed = _prediction_embed_for_match(
             title_line=sess.title_line,
             team_id=sess.team_id,
@@ -320,6 +866,7 @@ class PredictionCog(commands.Cog):
             win_votes=win_votes,
             lose_votes=lose_votes,
             tracked_names=[t["name"] for t in sess.tracked],
+            role_lines=getattr(sess, 'role_lines', None),
         )
 
         view = PredictionView(self, sess.match_id) if sess.voting_open else None
@@ -348,7 +895,7 @@ class PredictionCog(commands.Cog):
         if not sess:
             return
 
-        close_at_ms = sess.game_start_time_ms + PREDICTION_VOTING_CLOSE_AFTER_SECONDS * 1000
+        close_at_ms = sess.game_start_time_ms + PREDICTION_VOTING_OPEN_SECONDS * 1000
         delay = max(0.0, (close_at_ms - int(time.time() * 1000)) / 1000.0)
         await asyncio.sleep(delay)
 
@@ -374,6 +921,12 @@ class PredictionCog(commands.Cog):
             await self._update_prediction_message(sess)
         except Exception:
             pass
+
+        # Delete the prediction message after the lock window
+        if sess.message_id:
+            asyncio.create_task(self._delete_message_later(sess.channel_id, sess.message_id, PREDICTION_VOTING_LOCK_SECONDS))
+            # Clear message_id since this message should no longer be used
+            sess.message_id = None
 
         # Wait for match result and score
         await self._wait_for_match_and_score(match_id)
@@ -460,7 +1013,7 @@ class PredictionCog(commands.Cog):
         except Exception:
             pass
 
-        asyncio.create_task(self._delete_message_later(sess.channel_id, sess.message_id))
+        asyncio.create_task(self._delete_message_later(sess.channel_id, sess.message_id, PREDICTION_PREDICTION_MESSAGE_DELETE_AFTER_SECONDS))
         sess.result_posted = True
         self._sessions.pop(sess.match_id, None)
 
@@ -499,38 +1052,80 @@ class PredictionCog(commands.Cog):
                     users[str(uid)] = entry
 
             _prediction_save_scores(self._scores)
-
-        # Post result by editing original message
-        if not sess.message_id:
-            return
+        # Post result as a NEW message (no edits to the original prediction message)
         channel = self.bot.get_channel(sess.channel_id)
         if not isinstance(channel, discord.abc.Messageable):
             return
 
-        correct_mentions = [f"<@{uid}>" for uid in correct_ids]
-        wrong_mentions = [f"<@{uid}>" for uid in wrong_ids]
+        # Build a top-6 leaderboard table (same formatting as /prediction_leaderboard)
+        users = (self._scores.get("users") or {})
+        rows: list[dict] = []
+        for uid, entry in users.items():
+            try:
+                correct = int(entry.get("correct", 0))
+                wrong = int(entry.get("wrong", 0))
+            except Exception:
+                correct, wrong = 0, 0
+            total = correct + wrong
+            if total <= 0:
+                continue
+            score = correct - wrong
+            acc = (correct / total) * 100.0 if total else 0.0
+            name = str(entry.get("name") or f"User-{uid}")
+            rows.append({"name": name, "score": score, "correct": correct, "wrong": wrong, "acc": acc})
+        rows.sort(key=lambda r: (r["score"], r["acc"], r["correct"]), reverse=True)
+        leaderboard_text = self._format_prediction_leaderboard(rows[:6]) if rows else None
 
-        embed = _prediction_result_embed(
+        # Build display names for the non-ping initial result message
+        correct_plain: list[str] = []
+        wrong_plain: list[str] = []
+        for uid in correct_ids:
+            entry = (self._scores.get("users") or {}).get(str(uid)) or {}
+            correct_plain.append(str(entry.get("name") or f"User-{uid}"))
+        for uid in wrong_ids:
+            entry = (self._scores.get("users") or {}).get(str(uid)) or {}
+            wrong_plain.append(str(entry.get("name") or f"User-{uid}"))
+
+        # Send WITHOUT mentions first (so nobody is notified), then edit after 3s with mentions.
+        embed_plain = _prediction_result_embed(
             title_line=sess.title_line,
             team_id=final_team_id,
             win=win,
-            correct_mentions=correct_mentions,
-            incorrect_mentions=wrong_mentions,
+            correct_lines=correct_plain,
+            incorrect_lines=wrong_plain,
             tracked_names=[t["name"] for t in sess.tracked],
+            leaderboard_text=leaderboard_text,
         )
 
         try:
-            msg = await channel.fetch_message(sess.message_id)
-            await msg.edit(embed=embed, view=None)
+            result_msg = await channel.send(embed=embed_plain)
+        except Exception:
+            sess.result_posted = True
+            self._sessions.pop(sess.match_id, None)
+            return
+
+        await asyncio.sleep(3)
+
+        embed_mentions = _prediction_result_embed(
+            title_line=sess.title_line,
+            team_id=final_team_id,
+            win=win,
+            correct_lines=[f"<@{uid}>" for uid in correct_ids],
+            incorrect_lines=[f"<@{uid}>" for uid in wrong_ids],
+            tracked_names=[t["name"] for t in sess.tracked],
+            leaderboard_text=leaderboard_text,
+        )
+        try:
+            await result_msg.edit(embed=embed_mentions)
         except Exception:
             pass
 
-        asyncio.create_task(self._delete_message_later(sess.channel_id, sess.message_id))
+        asyncio.create_task(self._delete_message_later(sess.channel_id, result_msg.id, PREDICTION_RESULT_MESSAGE_DELETE_AFTER_SECONDS))
         sess.result_posted = True
         self._sessions.pop(sess.match_id, None)
 
-    async def _delete_message_later(self, channel_id: int, message_id: int) -> None:
-        await asyncio.sleep(PREDICTION_DELETE_AFTER_SECONDS)
+    async def _delete_message_later(self, channel_id: int, message_id: int, delay_seconds: int) -> None:
+        await asyncio.sleep(int(delay_seconds or 0))
         try:
             channel = self.bot.get_channel(channel_id)
             if isinstance(channel, discord.abc.Messageable):
@@ -559,60 +1154,68 @@ class PredictionCog(commands.Cog):
         try:
             async with aiohttp.ClientSession() as http:
                 # Resolve and check active game for each tracked profile
-                for display_name, riot in (FLEX_PROFILES or {}).items():
-                    game_name = riot.get("sumname")
-                    tag_line = riot.get("tag")
-                    if not game_name or not tag_line:
-                        continue
+                # Requested behavior:
+                # - Only FLEX games (440) are tracked for FLEX_PROFILES
+                # - Only SoloQ games (420) are tracked for SOLOQ_PROFILES
+                profile_sources = [
+                    (FLEX_PROFILES or {}, {440}),
+                    (SOLOQ_PROFILES or {}, {420}),
+                ]
 
-                    try:
-                        ident = await self._resolve_identity(http, api_key, game_name, tag_line)
-                        puuid = ident["puuid"]
-                        platform = ident["platform"]
-
-                        in_game, info = await _spectate_check_active_game(http, api_key, platform, puuid)
-                        if not in_game or not info:
+                for profiles_dict, allowed_queues in profile_sources:
+                    for display_name, riot in profiles_dict.items():
+                        game_name = riot.get("sumname")
+                        tag_line = riot.get("tag")
+                        if not game_name or not tag_line:
                             continue
 
-                        queue_id = int(info.get("gameQueueConfigId") or 0)
-                        if queue_id not in (420, 440):
-                            continue  # only ranked Solo/Duo and Flex
+                        try:
+                            ident = await self._resolve_identity(http, api_key, game_name, tag_line)
+                            puuid = ident["puuid"]
+                            platform = ident["platform"]
 
-                        platform_id = str(info.get("platformId") or platform).upper()
-                        game_id = int(info.get("gameId"))
-                        match_id = _prediction_make_match_id(platform_id, game_id)
-                        region = _prediction_match_region_for_platform(platform)
-                        gst = int(info.get("gameStartTime") or int(time.time() * 1000))
+                            in_game, info = await _spectate_check_active_game(http, api_key, platform, puuid)
+                            if not in_game or not info:
+                                continue
 
-                        # Determine this player's team
-                        team_id = None
-                        for p in (info.get("participants") or []):
-                            if p.get("puuid") == puuid:
-                                team_id = int(p.get("teamId") or 0)
-                                break
-                        if team_id not in (100, 200):
+                            queue_id = int(info.get("gameQueueConfigId") or 0)
+                            if queue_id not in allowed_queues:
+                                continue
+
+                            platform_id = str(info.get("platformId") or platform).upper()
+                            game_id = int(info.get("gameId"))
+                            match_id = _prediction_make_match_id(platform_id, game_id)
+                            region = _prediction_match_region_for_platform(platform)
+                            gst = int(info.get("gameStartTime") or int(time.time() * 1000))
+
+                            # Determine this player's team
+                            team_id = None
+                            for p in (info.get("participants") or []):
+                                if p.get("puuid") == puuid:
+                                    team_id = int(p.get("teamId") or 0)
+                                    break
+                            if team_id not in (100, 200):
+                                continue
+
+                            g = games.setdefault(match_id, {
+                                "platform": platform,
+                                "platform_id": platform_id,
+                                "region": region,
+                                "game_id": game_id,
+                                "queue_id": queue_id,
+                                "game_start_time_ms": gst,
+                                "tracked": [],
+                                "participants": info.get("participants") or [],
+                            })
+                            g["queue_id"] = queue_id
+                            g["game_start_time_ms"] = min(int(g.get("game_start_time_ms") or gst), gst)
+                            g["tracked"].append({"name": display_name, "puuid": puuid, "teamId": team_id})
+                        except SpectateAPIError as e:
+                            print(f"[Predict] Riot error for {display_name}: {e}")
                             continue
-
-                        g = games.setdefault(match_id, {
-                            "platform": platform,
-                            "platform_id": platform_id,
-                            "region": region,
-                            "game_id": game_id,
-                            "queue_id": queue_id,
-                            "game_start_time_ms": gst,
-                            "tracked": [],
-                        })
-                        g["queue_id"] = queue_id  # should match for all participants
-                        # Use earliest start time (in case)
-                        g["game_start_time_ms"] = min(int(g.get("game_start_time_ms") or gst), gst)
-                        g["tracked"].append({"name": display_name, "puuid": puuid, "teamId": team_id})
-                    except SpectateAPIError as e:
-                        # Rate limit etc; just skip this cycle
-                        print(f"[Predict] Riot error for {display_name}: {e}")
-                        continue
-                    except Exception as e:
-                        print(f"[Predict] Error checking {display_name}: {type(e).__name__}: {e}")
-                        continue
+                        except Exception as e:
+                            print(f"[Predict] Error checking {display_name}: {type(e).__name__}: {e}")
+                            continue
 
         except Exception as e:
             print(f"[Predict] poll loop error: {e}")
@@ -663,6 +1266,22 @@ class PredictionCog(commands.Cog):
                         team_id = tid
                         break
 
+
+
+            # Build matchup lines with enemy ranks (one-time per match)
+
+            role_lines = []
+
+            try:
+
+                async with aiohttp.ClientSession() as _http:
+
+                    role_lines = await self._build_champ_role_lines(_http, api_key, str(g.get('platform')), g.get('participants') or [], team_id, tracked=tracked, queue_id=queue_id)
+
+            except Exception:
+
+                role_lines = []
+
             sess = PredictionSession(
                 match_id=match_id,
                 platform=str(g.get("platform")),
@@ -675,6 +1294,7 @@ class PredictionCog(commands.Cog):
                 team_id=team_id,
                 game_start_time_ms=int(g.get("game_start_time_ms")),
                 channel_id=self._channel_id,
+                role_lines=role_lines,
             )
             self._sessions[match_id] = sess
             self._recent_seen[match_id] = time.time()
@@ -689,6 +1309,73 @@ class PredictionCog(commands.Cog):
     # -----------------------------
     # Slash command: /prediction_leaderboard
     # -----------------------------
+
+    def _format_prediction_leaderboard(self, rows: list[dict]) -> str:
+        """Format like the OP.GG flex leaderboard: a wide monospace table.
+
+        rows: [{name, score, correct, wrong, acc}]
+        """
+        if not rows:
+            return (
+                "**📊 PREDICTION LEADERBOARD**\n"
+                "```text\n"
+                "No prediction history yet.\n"
+                "```"
+            )
+
+        # ----- Boxed table (ASCII only so alignment stays perfect) -----
+        rank_col = [str(i) for i in range(1, len(rows) + 1)]
+        name_col = [str(r.get("name") or "--") for r in rows]
+        score_col = [str(int(r.get("score", 0))) for r in rows]
+        wl_col = [f"{int(r.get('correct', 0))}-{int(r.get('wrong', 0))}" for r in rows]
+        acc_col = [f"{float(r.get('acc', 0.0)):.0f}%" for r in rows]
+
+        # Column widths
+        rank_w = max(len("RK"), max(len(x) for x in rank_col))
+        name_w = max(len("Player"), max(len(x) for x in name_col))
+        score_w = max(len("Score"), max(len(x) for x in score_col))
+        wl_w = max(len("W-L"), max(len(x) for x in wl_col))
+        acc_w = max(len("Acc%"), max(len(x) for x in acc_col))
+
+        lines: list[str] = []
+        lines.append("**📊 PREDICTION LEADERBOARD**")
+        lines.append("```text")
+
+        header = (
+            f"{'RK'.rjust(rank_w)}  "
+            f"{'Player'.ljust(name_w)}   "
+            f"{'Score'.rjust(score_w)}  "
+            f"{'W-L'.rjust(wl_w)}  "
+            f"{'Acc%'.rjust(acc_w)}"
+        )
+        lines.append(header)
+        lines.append("-" * (len(header) + 1))
+
+        for idx, (rk, nm, sc, wl, ac) in enumerate(zip(rank_col, name_col, score_col, wl_col, acc_col), start=1):
+            # Top 3 medals, same style as flex leaderboard
+
+            rk_field = rk.rjust(rank_w)
+
+            # Keep columns aligned; pad medal rows to the same width as numeric ranks.
+            rk_cell = rk_field.ljust(rank_w) if idx <= 3 else rk_field
+            line = f"{rk_cell}  "
+
+            # Truncate very long names to keep table readable
+            if len(nm) > 24:
+                nm_disp = nm[:23] + "…"
+            else:
+                nm_disp = nm
+
+            line += (
+                f"{nm_disp.ljust(name_w)}   "
+                f"{sc.rjust(score_w)}  "
+                f"{wl.rjust(wl_w)}  "
+                f"{ac.rjust(acc_w)}"
+            )
+            lines.append(line)
+
+        lines.append("```")
+        return "\n".join(lines)
 
     @app_commands.command(name="prediction_leaderboard", description="View prediction leaderboard (+1 correct, -1 wrong).")
     async def prediction_leaderboard(self, interaction: discord.Interaction):
@@ -717,22 +1404,9 @@ class PredictionCog(commands.Cog):
             return
 
         top = rows[:25]
-        # Build a compact monospace table
-        lines = []
-        lines.append(f"{'#':>2}  {'Discord':<18}  {'Score':>5}  {'W-L':>7}  {'Acc%':>6}")
-        lines.append("-" * 46)
-        for i, r in enumerate(top, start=1):
-            wl = f"{r['correct']}-{r['wrong']}"
-            nm = r["name"]
-            if len(nm) > 18:
-                nm = nm[:15] + "…"
-            lines.append(f"{i:>2}  {nm:<18}  {r['score']:>5}  {wl:>7}  {r['acc']:>5.0f}%")
-
-        embed = discord.Embed(
-            title="📊 Prediction Leaderboard",
-            description="```text\n" + "\n".join(lines) + "\n```",
-        )
-        await interaction.response.send_message(embed=embed)
+        # IMPORTANT: send as a normal message (not an embed) so Discord doesn't wrap the table.
+        msg = self._format_prediction_leaderboard(top)
+        await interaction.response.send_message(msg)
 
 
 #$env:ENABLE_KEYSEQ_PRESS="1"
@@ -951,6 +1625,10 @@ FLEX_PROFILES = {
         "sumname": "Parky",
         "tag": "NA1",
     },
+    "ParkySmurf": {
+        "sumname": "Glitch313",
+        "tag": "1989",
+    },
     "Josh": {
         "sumname": "DrkCloak",
         "tag": "NA1",
@@ -982,6 +1660,37 @@ FLEX_PROFILES = {
     "Marcus": {
         "sumname": "Cylainius",
         "tag": "NOXUS",
+    },
+    "Fogarche": {
+        "sumname": "Fogarche",
+        "tag": "NA1",
+    },
+    "Trey": {
+        "sumname": "TheLargestCat",
+        "tag": "NA1",
+    }
+}
+
+SOLOQ_PROFILES = {
+    "Blake": {
+        "sumname": "Schmort",
+        "tag": "bone",
+    },
+    "Parky": {
+        "sumname": "Parky",
+        "tag": "NA1",
+    },
+    "Josh": {
+        "sumname": "DrkCloak",
+        "tag": "NA1",
+    },
+    "Bi": {
+        "sumname": "WhiteSwan",
+        "tag": "4242",
+    },
+    "Cody": {
+        "sumname": "Cody",
+        "tag": "1414",
     }
 }
 
@@ -2016,7 +2725,7 @@ async def _fetch_opgg_flex_matches_from_url(context, opgg_url: str) -> list[dict
             if not body:
                 return
             # Your log spam is fine; keep it if you want:
-            print(f"[OPGG] RSC resp {resp.status} size={len(body)} url={resp.url}")
+            #print(f"[OPGG] RSC resp {resp.status} size={len(body)} url={resp.url}")
 
             # Heuristic: the real payload is large and contains a "1:" JSON line
             # (the tiny 53/215/693 ones are fragments)
@@ -4864,8 +5573,8 @@ async def on_ready():
     # register your cogs
     await bot.add_cog(SummaryCog(bot))
     await bot.add_cog(GeneralCog(bot))
-    if not TEST_MODE:
-        await bot.add_cog(AdminRollCog(bot))
+    #if not TEST_MODE:
+        #await bot.add_cog(AdminRollCog(bot))
     await bot.add_cog(ShopCog(bot))
     await bot.add_cog(RPSCog(bot))
     await bot.add_cog(CustomsCog(bot))
@@ -4877,15 +5586,14 @@ async def on_ready():
     josh_soloq_lp_nickname_loop.start()
 
 
-    if not auto_spectate_loop.is_running():
-        auto_spectate_loop.start()
+    #if not auto_spectate_loop.is_running():
+    #    auto_spectate_loop.start()
 
     
 
     guild_ids = [
         1086751625324003369,
         753949534387961877,
-        1287144786452680744,
     ]
 
     for gid in guild_ids:
