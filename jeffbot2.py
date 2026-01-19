@@ -1621,6 +1621,10 @@ FLEX_PROFILES = {
         "sumname": "Schmort",
         "tag": "bone",
     },
+    "FentBaby": {
+        "sumname": "FentBaby",
+        "tag": "DEA",
+    },
     "Parky": {
         "sumname": "Parky",
         "tag": "NA1",
