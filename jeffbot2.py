@@ -5495,7 +5495,7 @@ async def _before_auto_spectate_loop():
 
 _ready_synced = False
 
-@tasks.loop(minutes=3)
+@tasks.loop(minutes=10)
 async def josh_soloq_lp_nickname_loop():
     """
     Every 30 minutes:
