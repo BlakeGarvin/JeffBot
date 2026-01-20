@@ -62,6 +62,9 @@ _PREDICTION_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # If env var is not set, we will fall back to FLEX_LEADERBOARD_CHANNEL_ID once it is defined later in this file.
 PREDICTION_CHANNEL_ID = 753959443263389737
+# Channel for SoloQ prediction messages
+SOLOQ_PREDICTION_CHANNEL_ID = 768133564385460254
+
 PREDICTION_POLL_INTERVAL_SECONDS = 20
 
 # Prediction message timing (requested behavior)
@@ -72,6 +75,35 @@ PREDICTION_VOTING_OPEN_SECONDS = 270
 PREDICTION_VOTING_LOCK_SECONDS = 30
 PREDICTION_PREDICTION_MESSAGE_DELETE_AFTER_SECONDS = PREDICTION_VOTING_OPEN_SECONDS + PREDICTION_VOTING_LOCK_SECONDS
 PREDICTION_RESULT_MESSAGE_DELETE_AFTER_SECONDS = 60
+
+# SoloQ channel behavior: keep the original prediction message and do not delete/repost.
+# After the match is scored, the SAME message is updated to the result view and deleted 90s later.
+SOLOQ_PREDICTION_MESSAGE_DELETE_AFTER_MATCH_DONE_SECONDS = 90
+
+# Per-queue routing + behavior (easy to adjust later)
+# - channel_id: where to post the prediction message
+# - keep_message_until_match_done: if True, we keep the original prediction message and edit it into the result
+# - post_result_as_new_message: if False, we edit the original message instead of sending a new result message
+# - prediction_delete_after_lock_seconds: if not None, delete the prediction message N seconds after voting locks
+PREDICTION_QUEUE_CONFIG = {
+    # Flex: current behavior (delete prediction message after lock; post separate result message)
+    440: {
+        'channel_id': int(PREDICTION_CHANNEL_ID),
+        'keep_message_until_game_end': False,
+        'post_result_as_new_message': True,
+        'delete_prediction_after_lock': True,
+        'message_delete_after_game_seconds': int(PREDICTION_RESULT_MESSAGE_DELETE_AFTER_SECONDS),
+    },
+    # SoloQ: routed to SoloQ channel, keep + edit original message (no delete/repost)
+    420: {
+        'channel_id': int(SOLOQ_PREDICTION_CHANNEL_ID),
+        'keep_message_until_game_end': True,
+        'post_result_as_new_message': False,
+        'delete_prediction_after_lock': False,
+        'message_delete_after_game_seconds': int(SOLOQ_PREDICTION_MESSAGE_DELETE_AFTER_MATCH_DONE_SECONDS),
+    },
+}
+
 
 PREDICTION_REMAKE_THRESHOLD_SECONDS = 360
 PREDICTION_RESULT_TIMEOUT_SECONDS = 5400
@@ -105,6 +137,18 @@ def _prediction_fmt_team(team_id: int) -> str:
 
 def _prediction_fmt_ts_discord(unix_seconds: int) -> str:
     return f"<t:{int(unix_seconds)}:R>"
+
+def _prediction_trunc_name_10(name: str) -> str:
+    """Truncate to 10 chars; if over, cut to 9 and add '.'"""
+    s = str(name or '')
+    return s if len(s) <= 10 else (s[:9] + '.')
+
+
+def _prediction_trunc_name10(name: str) -> str:
+    """Truncate to 10 chars; if over 10, cut to 9 and add '.' (single-dot truncation)."""
+    s = str(name or '')
+    return s if len(s) <= 10 else (s[:9] + '.')
+
 
 
 def _prediction_load_scores() -> dict:
@@ -142,6 +186,12 @@ def _prediction_upsert_user(scores_data: dict, user: discord.abc.User) -> dict:
     users[uid] = entry
     return entry
 
+def _prediction_truncate_name_10(name: str) -> str:
+    """Truncate names to max 10 chars; if longer, cut to 9 and add a single '.'"""
+    s = str(name or '')
+    return s if len(s) <= 10 else (s[:9] + '.')
+
+
 
 def _prediction_embed_for_match(
     title_line: str,
@@ -155,11 +205,25 @@ def _prediction_embed_for_match(
     role_lines: list[str] | None = None,
 ) -> discord.Embed:
     start_unix = int(game_start_ms // 1000)
+    now_ms = int(time.time() * 1000)
+
     if voting_open:
-        vote_line = 'Voting open.'
+        close_at_ms = game_start_ms + (PREDICTION_VOTING_OPEN_SECONDS * 1000)
+        remaining_ms = max(0, close_at_ms - now_ms)
+        remaining_s = remaining_ms // 1000
+
+        close_unix = int(close_at_ms // 1000)
+
+        if remaining_s >= 60:
+            m = remaining_s // 60
+            s = remaining_s % 60
+            vote_line = f'Voting closes {_prediction_fmt_ts_discord(close_unix)}.'
+        else:
+            vote_line = f'Voting closes {_prediction_fmt_ts_discord(close_unix)}.'
     else:
         closed_unix = int((voting_closed_at_ms // 1000) if voting_closed_at_ms else start_unix)
         vote_line = f'Voting closed {_prediction_fmt_ts_discord(closed_unix)}.'
+
 
     roster = ', '.join(tracked_names) if tracked_names else '(none)'
     desc = (
@@ -244,6 +308,12 @@ class PredictionSession:
     channel_id: int
     message_id: int | None = None
 
+    # Routing / lifecycle behavior
+    keep_message_until_game_end: bool = False
+    post_result_as_new_message: bool = True
+    delete_prediction_after_lock: bool = True
+    message_delete_after_game_seconds: int = PREDICTION_RESULT_MESSAGE_DELETE_AFTER_SECONDS
+
     # Champ matchup table lines (TOP/JG/MID/ADC/SPP): each line is 'ROLE: BlueChamp | RedChamp'
     role_lines: list[str] = field(default_factory=list)
 
@@ -269,6 +339,7 @@ class PredictionCog(commands.Cog):
         if self._channel_id == 0:
             print("[Predict] WARNING: No prediction channel set. Set PREDICTION_CHANNEL_ID env var.")
 
+
         # Cache Riot identity resolution so we don't probe every loop.
         # key = f"{game_name}#{tag}" lower
         self._identity_cache: dict[str, dict] = {}
@@ -292,6 +363,30 @@ class PredictionCog(commands.Cog):
 
         # Start poll loop
         self.prediction_poll_loop.start()
+
+
+    def _queue_config(self, queue_id: int) -> dict:
+        cfg = (PREDICTION_QUEUE_CONFIG or {}).get(int(queue_id or 0))
+        # Fallback to Flex behavior in the default prediction channel
+        if not isinstance(cfg, dict):
+            cfg = (PREDICTION_QUEUE_CONFIG or {}).get(440) or {}
+        return cfg
+
+
+    def _queue_cfg(self, queue_id: int) -> dict:
+        """Return per-queue routing/behavior config (falls back to Flex defaults)."""
+        qid = int(queue_id or 0)
+        cfg = PREDICTION_QUEUE_CONFIG.get(qid)
+        if isinstance(cfg, dict):
+            return cfg
+        # Fallback: use Flex defaults
+        return PREDICTION_QUEUE_CONFIG.get(440) or {
+            'channel_id': int(self._channel_id),
+            'keep_message_until_match_done': False,
+            'post_result_as_new_message': True,
+            'prediction_delete_after_lock_seconds': int(PREDICTION_VOTING_LOCK_SECONDS),
+            'result_delete_after_seconds': int(PREDICTION_RESULT_MESSAGE_DELETE_AFTER_SECONDS),
+        }
 
 
     async def _ddragon_get_champ_map(self, http: aiohttp.ClientSession) -> dict[int, str]:
@@ -689,17 +784,17 @@ class PredictionCog(commands.Cog):
 
             puuid = e.get('puuid') or ''
             if not puuid:
-                enemy_disp.append(f"{champ} (Anon)")
+                enemy_disp.append(f"{champ}\t(Anon)")
                 continue
 
             entries = await self._fetch_league_entries_by_puuid(http, api_key, platform, puuid)
             q_letter, cr = compact_rank(entries if isinstance(entries, list) else [])
 
             if not q_letter or not cr:
-                enemy_disp.append(f"{champ} (Anon)")
+                enemy_disp.append(f"{champ}\t(Anon)")
             else:
                 # IMPORTANT: remove the space after (S)/(F)
-                enemy_disp.append(f"{champ} ({q_letter}){cr}")
+                enemy_disp.append(f"{champ}\t({q_letter}){cr}")
 
         # Helpers for compact display
         def name_in_parens(name: str) -> str:
@@ -726,27 +821,28 @@ class PredictionCog(commands.Cog):
             puuid = a.get('puuid') or ''
 
             if tracked_name:
-                ally_disp.append(f"{champ} {paren_name(tracked_name)}")
+                ally_disp.append(f"{champ}\t{paren_name(tracked_name)}")
                 continue
 
             # FLEX: show champ + summoner name (no rank) for non-tracked allies
             if int(queue_id or 0) == 440:
-                ally_disp.append(f"{champ} {paren_name(summ_name or 'Anon')}")
+                ally_disp.append(f"{champ}\t{paren_name(summ_name or 'Anon')}")
                 continue
 
             # Non-flex behavior: fall back to compact rank (or Anon)
             if not puuid:
-                ally_disp.append(f"{champ} (Anon)")
+                ally_disp.append(f"{champ}\t(Anon)")
                 continue
 
             entries = await self._fetch_league_entries_by_puuid(http, api_key, platform, puuid)
             q_letter, cr = compact_rank(entries if isinstance(entries, list) else [])
 
             if not q_letter or not cr:
-                ally_disp.append(f"{champ} (Anon)")
+                ally_disp.append(f"{champ}\t(Anon)")
             else:
                 # no space after (S)/(F)
-                ally_disp.append(f"{champ} ({q_letter}){cr}")
+                ally_disp.append(f"{champ}\t({q_letter}){cr}")
+
 
 
         # Ensure exactly 5 lines per side
@@ -759,26 +855,63 @@ class PredictionCog(commands.Cog):
 
         # Dynamic widths to prevent Discord mobile wrapping.
         # Keep the table compact: smaller widths mean fewer trailing spaces.
-        max_left = max(len(s) for s in ally_disp + ['ALLIES'])
-        max_right = max(len(s) for s in enemy_disp + ['ENEMIES'])
-        left_w = max(len('ALLIES'), min(max_left, 16))
-        right_w = max(len('ENEMIES'), min(max_right, 16))
+                # Dynamic widths to prevent Discord mobile wrapping.
+        # Keep the table compact: smaller widths mean fewer trailing spaces.
 
-        def fit(s: str, w: int) -> str:
-            s = str(s or '')
+        def vis_len(s: str) -> int:
+            s = str(s or "")
+            if "\t" in s:
+                name, rank = s.split("\t", 1)
+                # +1 because we will always keep at least one gap between name and rank
+                return len(name) + 1 + len(rank)
+            return len(s)
+
+        max_left = max(vis_len(s) for s in ally_disp + ["ALLIES"])
+        max_right = max(vis_len(s) for s in enemy_disp + ["ENEMIES"])
+        left_w = max(len("ALLIES"), min(max_left, 16))
+        right_w = max(len("ENEMIES"), min(max_right, 16))
+
+        # Rank column width: "(S)G2" / "(F)P4" etc.
+        SUFFIX_W = 8  # fits "(Anon)", "(Test)", "(S)M289"
+
+
+        def trunc_dot(s: str, w: int) -> str:
+            s = str(s or "")
             if len(s) > w:
                 if w <= 1:
                     return s[:w]
-                # single-dot truncation (requested)
-                return s[: w - 1] + '.'
-            return s.ljust(w)
+                return s[: w - 1] + "."
+            return s
+
+        def fit_cell(s: str, w: int) -> str:
+            s = str(s or "")
+
+            if "\t" in s:
+                name, suffix = s.split("\t", 1)
+                name = (name or "").rstrip()
+                suffix = (suffix or "").strip()
+
+                # Hard cap suffix so it can NEVER push the divider
+                if len(suffix) > SUFFIX_W:
+                    suffix = suffix[:SUFFIX_W]
+
+                # Reserve space for right-aligned suffix
+                name_w = max(1, w - SUFFIX_W)
+                name = trunc_dot(name, name_w)
+
+                return f"{name:<{name_w}}{suffix:>{SUFFIX_W}}"
+
+            # No suffix → normal left-aligned cell
+            return trunc_dot(s, w).ljust(w)
+
 
         lines: list[str] = []
-        lines.append(f"{fit('ALLIES', left_w)} | {fit('ENEMIES', right_w).rstrip()}")
+        lines.append(f"{fit_cell('ALLIES', left_w)}| {fit_cell('ENEMIES', right_w).rstrip()}")
         for i in range(5):
-            lines.append(f"{fit(ally_disp[i], left_w)} | {fit(enemy_disp[i], right_w).rstrip()}")
+            lines.append(f"{fit_cell(ally_disp[i], left_w)}| {fit_cell(enemy_disp[i], right_w).rstrip()}")
 
         return lines
+
 
     # Riot API helpers (same method as predictor)
     # -----------------------------
@@ -797,6 +930,13 @@ class PredictionCog(commands.Cog):
         self._identity_cache[key] = cached
         return cached
 
+    def _get_queue_behavior(self, queue_id: int) -> dict:
+        """Return per-queue routing/lifecycle config (easy to tweak later)."""
+        try:
+            return dict(PREDICTION_QUEUE_CONFIG.get(int(queue_id or 0)) or {})
+        except Exception:
+            return {}
+
     async def _fetch_match_v5(self, session: aiohttp.ClientSession, api_key: str, region: str, match_id: str) -> tuple[int, object]:
         url = f"https://{region}.api.riotgames.com/lol/match/v5/matches/{match_id}"
         return await _spectate_http_get_json(session, url, api_key)
@@ -806,9 +946,22 @@ class PredictionCog(commands.Cog):
     # -----------------------------
 
     async def handle_vote(self, interaction: discord.Interaction, match_id: str, choice: str) -> None:
+        # Acknowledge the button interaction immediately so Discord doesn't show 'Interaction failed'.
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.defer(thinking=False)
+        except Exception:
+            pass
+
         sess = self._sessions.get(match_id)
         if not sess or not sess.voting_open:
-            await interaction.response.send_message("Voting is closed for this match.", ephemeral=True)
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send("Voting is closed for this match.", ephemeral=True)
+                else:
+                    await interaction.response.send_message("Voting is closed for this match.", ephemeral=True)
+            except Exception:
+                pass
             return
 
         sess.votes[interaction.user.id] = choice
@@ -922,8 +1075,8 @@ class PredictionCog(commands.Cog):
         except Exception:
             pass
 
-        # Delete the prediction message after the lock window
-        if sess.message_id:
+        # Delete the prediction message after the lock window (queue-dependent)
+        if sess.message_id and bool(getattr(sess, 'delete_prediction_after_lock', True)):
             asyncio.create_task(self._delete_message_later(sess.channel_id, sess.message_id, PREDICTION_VOTING_LOCK_SECONDS))
             # Clear message_id since this message should no longer be used
             sess.message_id = None
@@ -1052,12 +1205,15 @@ class PredictionCog(commands.Cog):
                     users[str(uid)] = entry
 
             _prediction_save_scores(self._scores)
-        # Post result as a NEW message (no edits to the original prediction message)
+        # Post result
+        # - Flex (default): post a NEW message and delete it shortly after
+        # - SoloQ: edit the original prediction message in-place and delete it after the game ends
+
         channel = self.bot.get_channel(sess.channel_id)
         if not isinstance(channel, discord.abc.Messageable):
             return
 
-        # Build a top-6 leaderboard table (same formatting as /prediction_leaderboard)
+        # Build a top-6 leaderboard table (same formatting as /prediction_leaderboard) (same formatting as /prediction_leaderboard)
         users = (self._scores.get("users") or {})
         rows: list[dict] = []
         for uid, entry in users.items():
@@ -1097,12 +1253,29 @@ class PredictionCog(commands.Cog):
             leaderboard_text=leaderboard_text,
         )
 
-        try:
-            result_msg = await channel.send(embed=embed_plain)
-        except Exception:
-            sess.result_posted = True
-            self._sessions.pop(sess.match_id, None)
-            return
+        result_msg = None
+        if bool(getattr(sess, 'post_result_as_new_message', True)):
+            # Send as a new message
+            try:
+                result_msg = await channel.send(embed=embed_plain)
+            except Exception:
+                sess.result_posted = True
+                self._sessions.pop(sess.match_id, None)
+                return
+        else:
+            # Edit the original prediction message in-place
+            if not sess.message_id:
+                sess.result_posted = True
+                self._sessions.pop(sess.match_id, None)
+                return
+            try:
+                msg = await channel.fetch_message(sess.message_id)
+                await msg.edit(embed=embed_plain, view=None)
+                result_msg = msg
+            except Exception:
+                sess.result_posted = True
+                self._sessions.pop(sess.match_id, None)
+                return
 
         await asyncio.sleep(3)
 
@@ -1120,7 +1293,7 @@ class PredictionCog(commands.Cog):
         except Exception:
             pass
 
-        asyncio.create_task(self._delete_message_later(sess.channel_id, result_msg.id, PREDICTION_RESULT_MESSAGE_DELETE_AFTER_SECONDS))
+        asyncio.create_task(self._delete_message_later(sess.channel_id, result_msg.id, int(getattr(sess, 'message_delete_after_game_seconds', PREDICTION_RESULT_MESSAGE_DELETE_AFTER_SECONDS))))
         sess.result_posted = True
         self._sessions.pop(sess.match_id, None)
 
@@ -1153,69 +1326,95 @@ class PredictionCog(commands.Cog):
 
         try:
             async with aiohttp.ClientSession() as http:
-                # Resolve and check active game for each tracked profile
-                # Requested behavior:
-                # - Only FLEX games (440) are tracked for FLEX_PROFILES
-                # - Only SoloQ games (420) are tracked for SOLOQ_PROFILES
-                profile_sources = [
-                    (FLEX_PROFILES or {}, {440}),
-                    (SOLOQ_PROFILES or {}, {420}),
-                ]
+                                # Resolve and check active game for each tracked profile
+                                # Deduplicate Riot accounts across FLEX_PROFILES and SOLOQ_PROFILES:
+                                # If the same Riot ID is in both, we only spectate-check once.
+                                unique_accounts: dict[str, dict] = {}
 
-                for profiles_dict, allowed_queues in profile_sources:
-                    for display_name, riot in profiles_dict.items():
-                        game_name = riot.get("sumname")
-                        tag_line = riot.get("tag")
-                        if not game_name or not tag_line:
-                            continue
+                                def _add_profiles(profiles_dict: dict, allowed_queues: set[int]) -> None:
+                                    for display_name, riot in (profiles_dict or {}).items():
+                                        game_name = (riot.get("sumname") or "").strip()
+                                        tag_line = (riot.get("tag") or "").strip()
+                                        if not game_name or not tag_line:
+                                            continue
+                                        key = f"{game_name}#{tag_line}".lower()
+                                        entry = unique_accounts.setdefault(key, {
+                                            "game_name": game_name,
+                                            "tag_line": tag_line,
+                                            "display_names": [],
+                                            "allowed_queues": set(),
+                                        })
+                                        entry["display_names"].append(display_name)
+                                        entry["allowed_queues"].update(allowed_queues)
 
-                        try:
-                            ident = await self._resolve_identity(http, api_key, game_name, tag_line)
-                            puuid = ident["puuid"]
-                            platform = ident["platform"]
+                                _add_profiles(FLEX_PROFILES, {440})
+                                _add_profiles(SOLOQ_PROFILES, {420})
 
-                            in_game, info = await _spectate_check_active_game(http, api_key, platform, puuid)
-                            if not in_game or not info:
-                                continue
+                                for _, acct in unique_accounts.items():
+                                    try:
+                                        game_name = acct["game_name"]
+                                        tag_line = acct["tag_line"]
+                                        allowed_queues = acct["allowed_queues"]
+                                        display_names = acct["display_names"]
 
-                            queue_id = int(info.get("gameQueueConfigId") or 0)
-                            if queue_id not in allowed_queues:
-                                continue
+                                        ident = await self._resolve_identity(http, api_key, game_name, tag_line)
+                                        puuid = ident["puuid"]
+                                        platform = ident["platform"]
 
-                            platform_id = str(info.get("platformId") or platform).upper()
-                            game_id = int(info.get("gameId"))
-                            match_id = _prediction_make_match_id(platform_id, game_id)
-                            region = _prediction_match_region_for_platform(platform)
-                            gst = int(info.get("gameStartTime") or int(time.time() * 1000))
+                                        in_game, info = await _spectate_check_active_game(http, api_key, platform, puuid)
+                                        if not in_game or not info:
+                                            continue
 
-                            # Determine this player's team
-                            team_id = None
-                            for p in (info.get("participants") or []):
-                                if p.get("puuid") == puuid:
-                                    team_id = int(p.get("teamId") or 0)
-                                    break
-                            if team_id not in (100, 200):
-                                continue
+                                        queue_id = int(info.get("gameQueueConfigId") or 0)
+                                        if queue_id not in allowed_queues:
+                                            continue
 
-                            g = games.setdefault(match_id, {
-                                "platform": platform,
-                                "platform_id": platform_id,
-                                "region": region,
-                                "game_id": game_id,
-                                "queue_id": queue_id,
-                                "game_start_time_ms": gst,
-                                "tracked": [],
-                                "participants": info.get("participants") or [],
-                            })
-                            g["queue_id"] = queue_id
-                            g["game_start_time_ms"] = min(int(g.get("game_start_time_ms") or gst), gst)
-                            g["tracked"].append({"name": display_name, "puuid": puuid, "teamId": team_id})
-                        except SpectateAPIError as e:
-                            print(f"[Predict] Riot error for {display_name}: {e}")
-                            continue
-                        except Exception as e:
-                            print(f"[Predict] Error checking {display_name}: {type(e).__name__}: {e}")
-                            continue
+                                        platform_id = str(info.get("platformId") or platform).upper()
+                                        game_id = int(info.get("gameId"))
+                                        match_id = _prediction_make_match_id(platform_id, game_id)
+                                        region = _prediction_match_region_for_platform(platform)
+                                        gst = int(info.get("gameStartTime") or int(time.time() * 1000))
+
+                                        # Determine this player's team
+                                        team_id = None
+                                        for p in (info.get("participants") or []):
+                                            if p.get("puuid") == puuid:
+                                                team_id = int(p.get("teamId") or 0)
+                                                break
+                                        if team_id not in (100, 200):
+                                            continue
+
+                                        g = games.setdefault(match_id, {
+                                            "platform": platform,
+                                            "platform_id": platform_id,
+                                            "region": region,
+                                            "game_id": game_id,
+                                            "queue_id": queue_id,
+                                            "game_start_time_ms": gst,
+                                            "tracked": [],
+                                            "participants": info.get("participants") or [],
+                                        })
+                                        g["queue_id"] = queue_id
+                                        g["game_start_time_ms"] = min(int(g.get("game_start_time_ms") or gst), gst)
+
+                                        # Avoid duplicate tracked entries (in case of overlap)
+                                        existing_puuids = {t.get("puuid") for t in g["tracked"]}
+                                        if puuid not in existing_puuids:
+                                            # If the same Riot account is listed under multiple display names,
+                                            # include them all in the roster text.
+                                            for dn in display_names:
+                                                g["tracked"].append({"name": dn, "puuid": puuid, "teamId": team_id})
+
+                                    except SpectateAPIError as e:
+                                        # Use one of the display names for logging (if available)
+                                        dn0 = (acct.get("display_names") or ["(unknown)"])[0]
+                                        print(f"[Predict] Riot error for {dn0}: {e}")
+                                        continue
+                                    except Exception as e:
+                                        dn0 = (acct.get("display_names") or ["(unknown)"])[0]
+                                        print(f"[Predict] Error checking {dn0}: {type(e).__name__}: {e}")
+                                        continue
+
 
         except Exception as e:
             print(f"[Predict] poll loop error: {e}")
@@ -1282,6 +1481,7 @@ class PredictionCog(commands.Cog):
 
                 role_lines = []
 
+            queue_cfg = self._get_queue_behavior(queue_id)
             sess = PredictionSession(
                 match_id=match_id,
                 platform=str(g.get("platform")),
@@ -1293,7 +1493,11 @@ class PredictionCog(commands.Cog):
                 tracked=tracked,
                 team_id=team_id,
                 game_start_time_ms=int(g.get("game_start_time_ms")),
-                channel_id=self._channel_id,
+                channel_id=int(queue_cfg.get('channel_id') or self._channel_id),
+                keep_message_until_game_end=bool(queue_cfg.get('keep_message_until_game_end') or False),
+                post_result_as_new_message=bool(queue_cfg.get('post_result_as_new_message') if "post_result_as_new_message" in queue_cfg else True),
+                delete_prediction_after_lock=bool(queue_cfg.get('delete_prediction_after_lock') if "delete_prediction_after_lock" in queue_cfg else True),
+                message_delete_after_game_seconds=int(queue_cfg.get('message_delete_after_game_seconds') or PREDICTION_RESULT_MESSAGE_DELETE_AFTER_SECONDS),
                 role_lines=role_lines,
             )
             self._sessions[match_id] = sess
@@ -1325,14 +1529,14 @@ class PredictionCog(commands.Cog):
 
         # ----- Boxed table (ASCII only so alignment stays perfect) -----
         rank_col = [str(i) for i in range(1, len(rows) + 1)]
-        name_col = [str(r.get("name") or "--") for r in rows]
+        name_col = [_prediction_truncate_name_10(str(r.get("name") or "--")) for r in rows]
         score_col = [str(int(r.get("score", 0))) for r in rows]
         wl_col = [f"{int(r.get('correct', 0))}-{int(r.get('wrong', 0))}" for r in rows]
         acc_col = [f"{float(r.get('acc', 0.0)):.0f}%" for r in rows]
 
         # Column widths
         rank_w = max(len("RK"), max(len(x) for x in rank_col))
-        name_w = max(len("Player"), max(len(x) for x in name_col))
+        name_w = max(len("Player"), 10)
         score_w = max(len("Score"), max(len(x) for x in score_col))
         wl_w = max(len("W-L"), max(len(x) for x in wl_col))
         acc_w = max(len("Acc%"), max(len(x) for x in acc_col))
@@ -1360,11 +1564,8 @@ class PredictionCog(commands.Cog):
             rk_cell = rk_field.ljust(rank_w) if idx <= 3 else rk_field
             line = f"{rk_cell}  "
 
-            # Truncate very long names to keep table readable
-            if len(nm) > 24:
-                nm_disp = nm[:23] + "…"
-            else:
-                nm_disp = nm
+            # Names are pre-truncated to 10 chars by _prediction_truncate_name_10
+            nm_disp = nm
 
             line += (
                 f"{nm_disp.ljust(name_w)}   "
@@ -1680,9 +1881,17 @@ SOLOQ_PROFILES = {
         "sumname": "Schmort",
         "tag": "bone",
     },
+    "FentBaby": {
+        "sumname": "FentBaby",
+        "tag": "DEA",
+    },
     "Parky": {
         "sumname": "Parky",
         "tag": "NA1",
+    },
+    "ParkySmurf": {
+        "sumname": "Glitch313",
+        "tag": "1989",
     },
     "Josh": {
         "sumname": "DrkCloak",
@@ -1695,7 +1904,35 @@ SOLOQ_PROFILES = {
     "Cody": {
         "sumname": "Cody",
         "tag": "1414",
-    }
+    },
+    "Ash": {
+        "sumname": "Ash",
+        "tag": "uoplw",
+    },
+    "Oqi": {
+        "sumname": "Oqi",
+        "tag": "NA1",
+    },
+    "Michael": {
+        "sumname": "MadiHales",
+        "tag": "NA1",
+    },
+    "Jeff": {
+        "sumname": "Tacoboy7777",
+        "tag": "NA1",
+    },
+    "Marcus": {
+        "sumname": "Cylainius",
+        "tag": "NOXUS",
+    },
+    "Fogarche": {
+        "sumname": "Fogarche",
+        "tag": "NA1",
+    },
+    "Trey": {
+        "sumname": "TheLargestCat",
+        "tag": "NA1",
+    },
 }
 
 DPM_FLEX_PROFILES_OLD = {
