@@ -1402,8 +1402,10 @@ class PredictionCog(commands.Cog):
                                         if puuid not in existing_puuids:
                                             # If the same Riot account is listed under multiple display names,
                                             # include them all in the roster text.
-                                            for dn in display_names:
-                                                g["tracked"].append({"name": dn, "puuid": puuid, "teamId": team_id})
+                                            # pick a single display name (first one)
+                                            dn = display_names[0]
+                                            g["tracked"].append({"name": dn, "puuid": puuid, "teamId": team_id})
+
 
                                     except SpectateAPIError as e:
                                         # Use one of the display names for logging (if available)
